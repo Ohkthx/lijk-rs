@@ -1,0 +1,9 @@
+# Personal / Project Specific
+.vscode/
+target/
+notes.txt
+commit_message
+*.env
+
+# OS generated files
+**/.DS_Store

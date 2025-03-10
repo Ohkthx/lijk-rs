@@ -1,0 +1,8 @@
+[package]
+name = "lijk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
