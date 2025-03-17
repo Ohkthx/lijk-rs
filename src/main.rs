@@ -1,216 +1,163 @@
-use anyhow::{Result, bail};
-use connection::{Connection, ConnectionError, Packet, PacketHandler, PacketType};
-use uuid::Uuid;
+#![warn(clippy::pedantic)]
 
-mod connection;
+use std::fmt::Display;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Exmaple of a payload from a packet.
-enum Payload {
-    None,
-    String(String),
-    Uuid(Uuid),
+use anyhow::Result;
+
+use client::Client;
+use net::{RemoteSocket, Socket};
+use server::Server;
+
+mod client;
+mod net;
+mod payload;
+mod server;
+mod utils;
+
+enum Flags {
+    Help,
+    Remote,
+    Local,
+    Client,
+    Server,
+    Solo,
 }
 
-impl From<&Packet> for Payload {
-    fn from(value: &Packet) -> Self {
-        let raw = value.get_payload();
-        if raw.is_empty() {
-            return Self::None;
+impl Flags {
+    /// List of currently enabled valid flags for the application.
+    const ENABLED: [Flags; 6] = [
+        Flags::Help,
+        Flags::Remote,
+        Flags::Local,
+        Flags::Client,
+        Flags::Server,
+        Flags::Solo,
+    ];
+
+    /// Creates the help message for the application.
+    fn help() -> String {
+        let mut header = String::from("Usage: cargo run -- ");
+        for flag in &Flags::ENABLED {
+            header.push_str(&format!("[{flag}] "));
         }
 
-        match value.get_type() {
-            PacketType::Error | PacketType::Message => {
-                Self::String(String::from_utf8_lossy(raw).to_string())
-            }
-            PacketType::Connect => Self::Uuid(Uuid::from_slice(raw).unwrap_or_default()),
-            _ => Self::None,
+        header.push_str("\n\nOptions:");
+        for flag in &Flags::ENABLED {
+            header.push_str(&format!("\n  {}", flag.description()));
+        }
+        header
+    }
+
+    /// Returns the description of the flag.
+    fn description(&self) -> String {
+        match self {
+            Flags::Help => String::from("--help: Show this help message."),
+            Flags::Remote => String::from("--remote: Use a remote connection to the server."),
+            Flags::Local => String::from("--local: Use a local connection to the server."),
+            Flags::Client => String::from("--client: Run as a client."),
+            Flags::Server => String::from("--server: Run as a server."),
+            Flags::Solo => String::from("--solo: Run both client and server in the same process."),
         }
     }
 }
 
-impl From<Packet> for Payload {
-    fn from(value: Packet) -> Self {
-        Self::from(&value)
-    }
-}
-
-/// Basic server implementation with 1 client.
-struct Server {
-    connection: Connection,
-    uuid: Uuid,
-}
-
-impl Server {
-    /// Creates a new server with the given connection.
-    fn new(connection: Connection) -> Self {
-        Self {
-            connection,
-            uuid: Uuid::new_v4(),
+impl From<&Flags> for &'static str {
+    fn from(val: &Flags) -> Self {
+        match val {
+            Flags::Help => "--help",
+            Flags::Remote => "--remote",
+            Flags::Local => "--local",
+            Flags::Client => "--client",
+            Flags::Server => "--server",
+            Flags::Solo => "--solo",
         }
     }
+}
 
-    /// Sends a packet to the client.
-    pub fn send(&self, packet: Packet) {
-        self.connection.send(packet);
-    }
-
-    /// Runs the server and handles incoming packets.
-    fn run(&mut self) -> Result<()> {
-        println!("Server is running!");
-        const MAX_PINGS: usize = 5;
-        let mut pings = 0;
-
-        loop {
-            let packet = self.connection.recv()?;
-            match packet.get_type() {
-                PacketType::Error => {
-                    if let Payload::String(payload) = Payload::from(packet) {
-                        println!("SERVER: Received error: {}", payload);
-                    }
-                }
-
-                PacketType::Acknowledge => println!("SERVER: Received acknowledge."),
-
-                PacketType::Connect => {
-                    println!("SERVER: Client is connecting.");
-                    let mut packet = Packet::new(PacketType::Connect, self.uuid);
-                    packet.set_payload(Uuid::new_v4().as_bytes());
-                    self.send(packet);
-                }
-
-                PacketType::Disconnect => {
-                    println!("SERVER: Client [{}] is disconnecting.", packet.get_uuid());
-                    break;
-                }
-
-                PacketType::Ping => {
-                    println!("SERVER: Received Ping.");
-                    pings += 1;
-                    if pings >= MAX_PINGS {
-                        println!("SERVER: Max pings reached. Sending disconnect command.");
-                        self.send(Packet::new(PacketType::Disconnect, Uuid::new_v4()));
-                        break;
-                    }
-                    self.send(Packet::new(PacketType::Pong, Uuid::new_v4()));
-                }
-
-                PacketType::Pong => {
-                    println!("SERVER: Received Pong.");
-                    pings += 1;
-                    if pings >= MAX_PINGS {
-                        println!("SERVER: Max pings reached. Sending disconnect command.");
-                        self.send(Packet::new(PacketType::Disconnect, Uuid::new_v4()));
-                        break;
-                    }
-                    self.send(Packet::new(PacketType::Ping, Uuid::new_v4()));
-                }
-
-                PacketType::Message => {
-                    if let Payload::String(payload) = Payload::from(packet) {
-                        println!("SERVER: Received message: {}", payload);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+impl Display for Flags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", <&'static str>::from(self))
     }
 }
 
-/// Basic client implementation that connects to a server.
-struct Client {
-    connection: Connection,
-    server: Uuid,
-    uuid: Uuid,
-}
+/// Spawns a server and a client in separate threads.
+fn as_solo(args: &[String]) -> Result<()> {
+    let (sconn, cconn) = if args.contains(&Flags::Remote.to_string()) {
+        // Initialize the remote connections.
+        let server = Socket::new_remote(None)?;
+        let server_addr = server.address().to_string();
+        let client = Socket::new_remote(Some(server_addr))?;
+        (server, client)
+    } else if args.contains(&Flags::Local.to_string()) {
+        // Initialize the local connections.
+        Socket::new_local_pair()?
+    } else {
+        Socket::new_local_pair()?
+    };
 
-impl Client {
-    /// Creates a new client with the given connection.
-    fn new(connection: Connection) -> Self {
-        Self {
-            connection,
-            server: Uuid::nil(),
-            uuid: Uuid::nil(),
-        }
-    }
-
-    /// Sends a packet to the server.
-    pub fn send(&self, packet: Packet) {
-        self.connection.send(packet);
-    }
-
-    /// Runs the client and handles incoming packets.
-    fn run(&mut self) -> Result<()> {
-        // Send a connect packet to the server.
-        self.send(Packet::new(PacketType::Connect, Uuid::nil()));
-
-        loop {
-            let packet = self.connection.recv()?;
-            match packet.get_type() {
-                PacketType::Error => {
-                    if let Payload::String(payload) = Payload::from(&packet) {
-                        println!("CLIENT: Received error: {}", payload);
-                    }
-                }
-
-                PacketType::Acknowledge => println!("CLIENT: Received acknowledge."),
-
-                PacketType::Connect => {
-                    if let Payload::Uuid(payload) = Payload::from(&packet) {
-                        self.uuid = payload;
-                    } else {
-                        println!("CLIENT: Received invalid connect packet.");
-                        bail!(ConnectionError::AuthenticationFailed);
-                    }
-
-                    self.server = packet.get_uuid();
-                    println!("CLIENT: Connected, UUID: {}.", self.uuid);
-                    self.send(Packet::new(PacketType::Ping, self.uuid));
-                }
-
-                PacketType::Disconnect => {
-                    println!("CLIENT: Server sent disconnect command.");
-                    break;
-                }
-
-                PacketType::Ping => {
-                    println!("CLIENT: Received Ping.");
-                    self.send(Packet::new(PacketType::Pong, self.uuid));
-                }
-
-                PacketType::Pong => {
-                    println!("CLIENT: Received Pong.");
-                    self.send(Packet::new(PacketType::Ping, self.uuid));
-                }
-
-                PacketType::Message => {
-                    if let Payload::String(payload) = Payload::from(packet) {
-                        println!("CLIENT: Received message: {}", payload);
-                    }
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
-        Ok(())
-    }
-}
-
-fn main() -> Result<()> {
-    // Initialize the local connections.
-    let (server_connection, client_connection) = Connection::new_local()?;
+    // Create a shutdown flag to signal the server to stop.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&shutdown_flag);
 
     // Spawn the server with a connection in a separate thread.
     let server_run = std::thread::spawn(move || {
-        let mut server = Server::new(server_connection);
-        server.run()
+        let mut server = Server::new(sconn);
+        while !flag_clone.load(Ordering::Relaxed) {
+            if let Err(why) = server.run_step() {
+                println!("SERVER: {why}");
+            }
+        }
     });
 
     // Create the client with a connection.
-    let mut client = Client::new(client_connection);
-    let result = client.run();
-    let _ = server_run.join();
+    let mut client = Client::new(cconn);
+    if let Err(why) = client.run() {
+        shutdown_flag.store(true, Ordering::Relaxed);
+        Err(why)
+    } else {
+        server_run.join().expect("Server thread panicked.");
+        Ok(())
+    }
+}
 
-    result
+/// Spawns a remote client used to connect to a remote server.
+fn as_client() -> Result<()> {
+    // Create a socket to connect to the server.
+    let server_addr = RemoteSocket::DEFAULT_SERVER_ADDR.to_string();
+    let socket = Socket::new_remote(Some(server_addr))?;
+
+    let mut client = Client::new(socket);
+    client.run()
+}
+
+/// Spawns a server that clients can connect to.
+fn as_server() -> Result<()> {
+    let socket = Socket::new_remote(None)?;
+    let mut server = Server::new(socket);
+    server.run()
+}
+
+fn main() {
+    let args = std::env::args().collect::<Vec<String>>();
+    let result = if args.contains(&Flags::Help.to_string()) {
+        println!("{}", Flags::help());
+        Ok(())
+    } else if args.contains(&Flags::Client.to_string()) {
+        as_client()
+    } else if args.contains(&Flags::Server.to_string()) {
+        as_server()
+    } else if args.contains(&Flags::Solo.to_string()) {
+        as_solo(&args)
+    } else {
+        println!("{}", Flags::help());
+        Ok(())
+    };
+
+    if let Err(why) = result {
+        println!("Error: {why}");
+    } else {
+        println!("Application exited successfully.");
+    }
 }

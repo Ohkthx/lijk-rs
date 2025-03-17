@@ -3,6 +3,34 @@ name = "lijk"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+debug_output = []
+
+[profile.dev]
+opt-level = 1
+debug = true
+strip = "none"
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = 'unwind'
+incremental = true
+codegen-units = 256
+rpath = false
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = 'unwind'
+incremental = false
+codegen-units = 16
+rpath = false
+
+
 [dependencies]
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
