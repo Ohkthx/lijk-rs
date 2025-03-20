@@ -73,7 +73,7 @@ Communication within `LIJK::NET` is built around `Packet` structs, which encapsu
 
 - **Version (`u8`)**: Indicates the protocol version.
 - **Type (`PacketType`)**: Defines the purpose of the packet (e.g., `Connect`, `Disconnect`, `Message`).
-- **Source (`Uuid`)**: The unique identifier of the sender.
+- **Source (`u32`)**: The unique identifier of the sender.
 - **Sequence (`u32`)**: A counter used to track packet order.
 - **Payload (`Vec<u8>`)**: The actual message contents.
 

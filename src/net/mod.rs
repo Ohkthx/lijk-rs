@@ -2,25 +2,29 @@ mod local;
 mod packet;
 mod remote;
 mod socket;
-
-use uuid::Uuid;
+mod storage;
 
 pub(crate) use local::LocalSocket;
 pub(crate) use remote::RemoteSocket;
 
-pub use packet::{Packet, PacketType};
+pub use packet::{Packet, PacketError, PacketType};
 pub use socket::Socket;
+use storage::ClientStorage;
+
+/// ID for the server.
+pub(crate) const SERVER_ID: u32 = 0;
+/// Invalid ID for a client.
+pub(crate) const INVALID_CLIENT_ID: u32 = ClientStorage::<()>::INVALID_CLIENT_ID;
 
 /// Used to specify the destination and packet for a socket action.
 pub struct Deliverable {
-    pub(crate) to: Uuid,
-    /// Destination UUID for the packet.
+    pub(crate) to: u32,        // ID of the destination user.
     pub(crate) packet: Packet, // Packet to be sent to the destination.
 }
 
 impl Deliverable {
     /// Creates a new deliverable with the given destination and packet.
-    pub fn new(to: Uuid, packet: Packet) -> Self {
+    pub fn new(to: u32, packet: Packet) -> Self {
         Self { to, packet }
     }
 }
@@ -35,7 +39,8 @@ pub enum ConnectionError {
     Disconnected,                         // Connection is disconnected.
     Timeout,                              // Connection timed out.
     SelfConnection,                       // Connection to self is not allowed.
-    InvalidPacketUuid(Uuid, Uuid),        // Packet UUID is invalid.
+    TooManyConnections,                   // Too many connections.
+    InvalidPacketSender(u32, u32),        // Packet Sender ID is invalid.
     InvalidPacketAddress(String, String), // Packet address is invalid.
     InvalidPacketVersion(u8),             // Packet version is invalid.
     InvalidPacketLength(usize),           // Packet length is invalid.
@@ -54,8 +59,12 @@ impl std::fmt::Display for ConnectionError {
             ConnectionError::Disconnected => write!(f, "Disconnected"),
             ConnectionError::Timeout => write!(f, "Connection Timeout"),
             ConnectionError::SelfConnection => write!(f, "Self Connection is not allowed"),
-            ConnectionError::InvalidPacketUuid(expected, got) => {
-                write!(f, "Invalid Packet UUID, expected {expected}, got {got}")
+            ConnectionError::TooManyConnections => write!(f, "Too Many Connections"),
+            ConnectionError::InvalidPacketSender(expected, got) => {
+                write!(
+                    f,
+                    "Invalid Packet Sender ID, expected {expected}, got {got}"
+                )
             }
             ConnectionError::InvalidPacketAddress(expected, got) => {
                 write!(f, "Invalid Packet Address, expected {expected}, got {got}")

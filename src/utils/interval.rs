@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::time::{Duration, Instant};
 
 /// A utility for managing time intervals in a loop.
@@ -17,6 +16,7 @@ impl Interval {
     }
 
     /// Executes the function if the current time is past the next scheduled time.
+    #[allow(dead_code)]
     pub fn if_ready<F>(&mut self, mut f: F)
     where
         F: FnMut(),

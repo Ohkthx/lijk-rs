@@ -1,11 +1,8 @@
-#![allow(dead_code)]
-
 use anyhow::{Result, bail};
-use uuid::Uuid;
 
 use crate::net::{ConnectionError, PacketType};
 
-use super::{Deliverable, LocalSocket, Packet, RemoteSocket};
+use super::{Deliverable, INVALID_CLIENT_ID, LocalSocket, Packet, RemoteSocket};
 
 /// Socket type for the connection. Either a remote or local connection.
 enum SocketType {
@@ -16,11 +13,14 @@ enum SocketType {
 /// Trait for handling packets.
 pub(crate) trait SocketHandler {
     /// Send a packet to the connection.
+    #[allow(dead_code)]
     fn send(&mut self, deliverable: Deliverable) -> Result<()>;
     /// Try to receive a packet from the connection.
+    #[allow(dead_code)]
     fn try_recv(&mut self) -> Result<Option<Packet>>;
     /// Waits to receive a packet from the connection.
-    fn recv(&mut self) -> Result<Packet>;
+    #[allow(dead_code)]
+    fn recv(&mut self) -> Result<Option<Packet>>;
 }
 
 /// Socket for the connection. Used to send and receive packets to a client / server.
@@ -30,6 +30,9 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Invalid client ID, normally an uninitialized client.
+    pub const INVALID_CLIENT_ID: u32 = INVALID_CLIENT_ID;
+
     /// Creates a new socket with the given socket type.
     fn new(socket: SocketType) -> Self {
         Self { socket }
@@ -77,12 +80,12 @@ impl Socket {
         }
     }
 
-    /// Local UUID of the socket.
+    /// Local ID of the socket.
     #[inline]
-    pub fn uuid(&self) -> Uuid {
+    pub fn id(&self) -> u32 {
         match &self.socket {
-            SocketType::Remote(socket) => socket.uuid(),
-            SocketType::Local(socket) => socket.uuid(),
+            SocketType::Remote(socket) => socket.id(),
+            SocketType::Local(socket) => socket.id(),
         }
     }
 
@@ -97,37 +100,39 @@ impl Socket {
 
     /// Obtains the UUIDs of the remote sockets.
     #[inline]
-    pub fn remote_uuids(&self) -> Vec<Uuid> {
+    pub fn remote_ids(&self) -> Vec<u32> {
         match &self.socket {
-            SocketType::Remote(socket) => socket.remote_uuids(),
-            SocketType::Local(socket) => socket.remote_uuids(),
+            SocketType::Remote(socket) => socket.remote_ids(),
+            SocketType::Local(socket) => socket.remote_ids(),
         }
     }
 
     /// Obtains the last sequence ID for the connection.
+    #[allow(dead_code)]
     #[inline]
-    pub fn last_sequence_id(&self) -> u32 {
+    pub fn last_sequence_id(&self, client_id: u32) -> Option<&u32> {
         match &self.socket {
-            SocketType::Remote(socket) => socket.last_sequence_id(),
-            SocketType::Local(socket) => socket.last_sequence_id(),
+            SocketType::Remote(socket) => socket.last_sequence_id(client_id),
+            SocketType::Local(socket) => socket.last_sequence_id(client_id),
         }
     }
 
     /// Disconnects a client from the server and notifies the client if requested.
-    pub fn disconnect_client(&mut self, uuid: Uuid, notify: bool) -> Result<()> {
+    pub fn disconnect_client(&mut self, client_id: u32, notify: bool) -> Result<()> {
         if !self.is_server() {
             bail!(ConnectionError::NotServer);
         }
 
         match &mut self.socket {
-            SocketType::Remote(socket) => socket.disconnect_client(uuid, notify),
-            SocketType::Local(socket) => socket.disconnect_client(uuid, notify),
+            SocketType::Remote(socket) => socket.disconnect_client(client_id, notify),
+            SocketType::Local(socket) => socket.disconnect_client(client_id, notify),
         }
     }
 
     /// Sends a packet to the destination UUID. If the packet is a connect packet, it will not check for self connection.
+    #[allow(dead_code)]
     pub fn send(&mut self, deliverable: Deliverable) -> Result<()> {
-        if self.uuid() == deliverable.to && deliverable.packet.get_type() != PacketType::Connect {
+        if self.id() == deliverable.to && deliverable.packet.get_type() != PacketType::Connect {
             bail!(ConnectionError::SelfConnection);
         }
 
@@ -138,6 +143,7 @@ impl Socket {
     }
 
     /// Tries to receive a packet from the connection. Returns None if no packet is available.
+    #[allow(dead_code)]
     pub fn try_recv(&mut self) -> Result<Option<Packet>> {
         match &mut self.socket {
             SocketType::Remote(socket) => socket.try_recv(),
@@ -146,7 +152,8 @@ impl Socket {
     }
 
     /// Waits to receive a packet from the connection. Returns an error if a connection issue occurs.
-    pub fn recv(&mut self) -> Result<Packet> {
+    #[allow(dead_code)]
+    pub fn recv(&mut self) -> Result<Option<Packet>> {
         match &mut self.socket {
             SocketType::Remote(socket) => socket.recv(),
             SocketType::Local(socket) => socket.recv(),

@@ -1,38 +1,44 @@
-use std::{collections::HashSet, sync::mpsc};
+use std::sync::mpsc;
 
 use anyhow::{Result, bail};
-use uuid::Uuid;
 
-use super::{ConnectionError, Deliverable, Packet, PacketType, socket::SocketHandler};
+use crate::net::PacketError;
+
+use super::socket::SocketHandler;
+use super::storage::ClientStorage;
+use super::{ConnectionError, Deliverable, INVALID_CLIENT_ID, Packet, PacketType, SERVER_ID};
 
 /// Local connection that uses MPSC to communicate locally.
 pub(crate) struct LocalSocket {
-    uuid: Uuid,       // Unique identifier for the connection.
-    is_server: bool,  // Used to test if a server or not.
-    sequence_id: u32, // Used to track the last sequence ID for the socket.
+    id: u32,         // Unique identifier for the connection.
+    is_server: bool, // Used to test if a server or not.
 
     tx: Option<mpsc::Sender<Packet>>,   // Sender for the connection.
     rx: Option<mpsc::Receiver<Packet>>, // Receiver for the connection.
 
-    remotes: HashSet<Uuid>, // Set of remote UUIDs currently connected to.
+    clients: ClientStorage<u32>, // Information about the clients connected to the server.
 }
 
 impl LocalSocket {
+    /// Maxmium clients for the server.
+    pub(crate) const MAX_CLIENTS: u32 = 1;
+
     /// Creates a new local connection.
     pub(crate) fn new(is_server: bool) -> Self {
-        let uuid = if is_server {
-            Uuid::new_v4()
+        let (id, offset) = if is_server {
+            (SERVER_ID, 1)
         } else {
-            Uuid::nil()
+            (INVALID_CLIENT_ID, 0)
         };
 
         Self {
-            uuid,
+            id,
             is_server,
-            sequence_id: 0,
+
             tx: None,
             rx: None,
-            remotes: HashSet::new(),
+
+            clients: ClientStorage::new(Self::MAX_CLIENTS, offset),
         }
     }
 
@@ -57,29 +63,16 @@ impl LocalSocket {
         Ok(())
     }
 
-    /// Obtains the last sequence ID for the connection.
-    #[inline]
-    pub(crate) fn last_sequence_id(&self) -> u32 {
-        self.sequence_id
-    }
-
-    /// Increments the sequence ID for the connection. Returning the previous ID.
-    fn increment_sequence_id(&mut self) -> u32 {
-        let id = self.sequence_id;
-        self.sequence_id = self.sequence_id.wrapping_add(1);
-        id
-    }
-
     /// Obtains the address of the socket.
     #[inline]
     pub(crate) fn address() -> &'static str {
         "localhost"
     }
 
-    /// Obtains the UUID of the socket.
+    /// Obtains the ID of the socket.
     #[inline]
-    pub(crate) fn uuid(&self) -> Uuid {
-        self.uuid
+    pub(crate) fn id(&self) -> u32 {
+        self.id
     }
 
     /// Checks if the connection is a server.
@@ -88,26 +81,35 @@ impl LocalSocket {
         self.is_server
     }
 
-    /// Returns the remote UUIDs connected to the server.
+    /// Obtains the last sequence ID for the client.
     #[inline]
-    pub(crate) fn remote_uuids(&self) -> Vec<Uuid> {
-        self.remotes.iter().copied().collect()
+    pub(crate) fn last_sequence_id(&self, client_id: u32) -> Option<&u32> {
+        self.clients.get_sequence(client_id)
     }
 
-    /// Removes a client from the address and UUID maps.
-    fn remove_client(&mut self, uuid: Uuid) {
-        // Remove the client from the remote list.
-        self.remotes
-            .retain(|&v| v != uuid && !v.is_nil() && v != self.uuid);
+    /// Returns the remote IDs connected to the server.
+    #[inline]
+    pub(crate) fn remote_ids(&self) -> Vec<u32> {
+        self.clients.addr_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Adds a new client, returning the client's ID.
+    fn add_client(&mut self, addr: u32) -> Result<u32> {
+        self.clients.add(addr)
+    }
+
+    /// Removes the client from the server.
+    fn remove_client(&mut self, client_id: u32) {
+        self.clients.remove(client_id);
     }
 
     /// Disconnects a client from the server.
     /// If `notify` is true, the client will be notified of the disconnection.
     /// Otherwise, the client will be silently disconnected.
-    pub(crate) fn disconnect_client(&mut self, uuid: Uuid, notify: bool) -> Result<()> {
+    pub(crate) fn disconnect_client(&mut self, uuid: u32, notify: bool) -> Result<()> {
         if notify && self.is_server() {
             // Send a disconnect packet to the client.
-            let to_send = Packet::new(PacketType::Disconnect, self.uuid);
+            let to_send = Packet::new(PacketType::Disconnect, self.id);
             self.send(Deliverable::new(uuid, to_send))?;
         }
 
@@ -115,26 +117,32 @@ impl LocalSocket {
         Ok(())
     }
 
-    /// Ensure the packet is valid. Additionally assigns an UUID to a new client.
+    /// Ensure the packet is valid. Additionally assigns an ID to a new client.
     fn validate_packet(&mut self, packet: &mut Packet) -> Result<()> {
         if packet.get_type() == PacketType::Connect {
-            if packet.get_source().is_nil() && self.is_server() {
-                // Server side, create a new UUID for the client.
-                packet.set_source(Uuid::new_v4());
-                self.remotes.insert(packet.get_source());
+            if packet.get_sender() == INVALID_CLIENT_ID && self.is_server() {
+                // Server side, create a new ID for the client.
+                let p_id = self.clients.next_id();
+                let client_id = self.add_client(p_id)?;
+                assert!(
+                    client_id == p_id,
+                    "Client ID ({client_id}) is not the same as the next ID ({p_id})"
+                );
+                packet.set_sender(client_id);
             } else if !self.is_server() {
-                // Client side, check if the UUID is valid.
-                const UUID_SIZE: usize = size_of::<Uuid>();
-                let raw_uuid = packet.get_payload();
-                if raw_uuid.len() == UUID_SIZE {
-                    self.uuid = Uuid::from_slice(raw_uuid).map_err(|_| {
+                const ID_SIZE: usize = size_of::<u32>();
+                let raw_id = packet.get_payload();
+                if raw_id.len() == ID_SIZE {
+                    self.id = u32::from_le_bytes(raw_id.try_into().map_err(|_| {
                         ConnectionError::InvalidPacketPayload(
-                            "UUID for Connection (Invalid)".to_string(),
+                            "ID for Connection (Invalid)".to_string(),
                         )
-                    })?;
+                    })?);
+                    self.clients
+                        .insert(packet.get_sender(), packet.get_sender());
                 } else {
                     bail!(ConnectionError::InvalidPacketPayload(
-                        "UUID for Connection (Missing)".to_string()
+                        "ID for Connection (Missing)".to_string()
                     ));
                 }
             }
@@ -146,8 +154,16 @@ impl LocalSocket {
 
 impl SocketHandler for LocalSocket {
     #[inline]
-    fn send(&mut self, Deliverable { mut packet, .. }: Deliverable) -> Result<()> {
-        packet.set_sequence(self.increment_sequence_id());
+    fn send(&mut self, Deliverable { to, mut packet, .. }: Deliverable) -> Result<()> {
+        if !(packet.get_sender() == INVALID_CLIENT_ID && packet.get_type() == PacketType::Connect) {
+            if let Some(seq) = self.clients.get_sequence_mut(to) {
+                *seq += 1;
+                packet.set_sequence(*seq);
+            } else {
+                bail!(ConnectionError::NotConnected);
+            };
+        }
+
         if let Some(tx) = &self.tx {
             let _ = tx.send(packet);
         } else {
@@ -162,7 +178,24 @@ impl SocketHandler for LocalSocket {
         if let Some(rx) = &self.rx {
             match rx.try_recv() {
                 Ok(mut packet) => {
-                    self.validate_packet(&mut packet)?;
+                    if let Err(why) = self.validate_packet(&mut packet) {
+                        if let Some(ConnectionError::TooManyConnections) =
+                            why.downcast_ref::<ConnectionError>()
+                        {
+                            let mut packet = Packet::new(PacketType::Error, self.id);
+                            let mut bytes = vec![PacketError::TooManyConnections as u8];
+                            bytes.extend_from_slice("Too many connections".as_bytes());
+                            packet.set_payload(&bytes);
+
+                            if let Some(tx) = &self.tx {
+                                let _ = tx.send(packet);
+                            }
+                            return Ok(None);
+                        }
+
+                        bail!(why);
+                    }
+
                     Ok(Some(packet))
                 }
                 Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -174,12 +207,29 @@ impl SocketHandler for LocalSocket {
     }
 
     #[inline]
-    fn recv(&mut self) -> Result<Packet> {
+    fn recv(&mut self) -> Result<Option<Packet>> {
         if let Some(rx) = &self.rx {
             match rx.recv() {
                 Ok(mut packet) => {
-                    self.validate_packet(&mut packet)?;
-                    Ok(packet)
+                    if let Err(why) = self.validate_packet(&mut packet) {
+                        if let Some(ConnectionError::TooManyConnections) =
+                            why.downcast_ref::<ConnectionError>()
+                        {
+                            let mut packet = Packet::new(PacketType::Error, self.id);
+                            let mut bytes = vec![PacketError::TooManyConnections as u8];
+                            bytes.extend_from_slice("Too many connections".as_bytes());
+                            packet.set_payload(&bytes);
+
+                            if let Some(tx) = &self.tx {
+                                let _ = tx.send(packet);
+                            }
+                            return Ok(None);
+                        }
+
+                        bail!(why);
+                    }
+
+                    Ok(Some(packet))
                 }
                 Err(_) => bail!(ConnectionError::Disconnected),
             }

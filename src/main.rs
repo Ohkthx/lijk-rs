@@ -9,12 +9,16 @@ use anyhow::Result;
 use client::Client;
 use net::{RemoteSocket, Socket};
 use server::Server;
+use utils::Timestep;
 
 mod client;
 mod net;
 mod payload;
 mod server;
 mod utils;
+
+const SERVER_TICK_RATE: f32 = 2048.0;
+const CLIENT_TICK_RATE: f32 = SERVER_TICK_RATE;
 
 enum Flags {
     Help,
@@ -104,22 +108,40 @@ fn as_solo(args: &[String]) -> Result<()> {
     // Spawn the server with a connection in a separate thread.
     let server_run = std::thread::spawn(move || {
         let mut server = Server::new(sconn);
+        let mut timestep = Timestep::new(SERVER_TICK_RATE);
+
         while !flag_clone.load(Ordering::Relaxed) {
             if let Err(why) = server.run_step() {
-                println!("SERVER: {why}");
+                println!("SERVER: Error while performing run step: {why}");
+            }
+
+            let behind = timestep.wait();
+            if behind > 0 {
+                debugln!("SERVER: Behind by {} ticks.", behind);
             }
         }
     });
 
     // Create the client with a connection.
     let mut client = Client::new(cconn);
-    if let Err(why) = client.run() {
-        shutdown_flag.store(true, Ordering::Relaxed);
-        Err(why)
-    } else {
-        server_run.join().expect("Server thread panicked.");
-        Ok(())
+    client.wait_for_connection()?;
+    let mut timestep = Timestep::new(CLIENT_TICK_RATE);
+
+    loop {
+        if let Err(why) = client.run_step() {
+            shutdown_flag.store(true, Ordering::Relaxed);
+            println!("CLIENT: Error while performing run step: {why}");
+            break;
+        }
+
+        let behind = timestep.wait();
+        if behind > 0 {
+            debugln!("CLIENT: Behind by {} ticks.", behind);
+        }
     }
+
+    server_run.join().expect("Server thread panicked.");
+    Ok(())
 }
 
 /// Spawns a remote client used to connect to a remote server.
@@ -129,14 +151,33 @@ fn as_client() -> Result<()> {
     let socket = Socket::new_remote(Some(server_addr))?;
 
     let mut client = Client::new(socket);
-    client.run()
+    client.wait_for_connection()?;
+    let mut timestep = Timestep::new(CLIENT_TICK_RATE);
+
+    loop {
+        client.run_step()?;
+
+        let behind = timestep.wait();
+        if behind > 0 {
+            debugln!("CLIENT: Behind by {} ticks.", behind);
+        }
+    }
 }
 
 /// Spawns a server that clients can connect to.
 fn as_server() -> Result<()> {
     let socket = Socket::new_remote(None)?;
     let mut server = Server::new(socket);
-    server.run()
+    let mut timestep = Timestep::new(SERVER_TICK_RATE);
+
+    loop {
+        server.run_step()?;
+
+        let behind = timestep.wait();
+        if behind > 0 {
+            debugln!("SERVER: Behind by {} ticks.", behind);
+        }
+    }
 }
 
 fn main() {

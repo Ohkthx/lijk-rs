@@ -1,22 +1,16 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant, SystemTime},
-};
+use ::std::collections::HashMap;
+use ::std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
-use uuid::Uuid;
 
+use crate::net::{Deliverable, Packet, PacketType, Socket};
 use crate::{debugln, utils};
 use crate::{net::ConnectionError, payload::Payload};
-use crate::{
-    net::{Deliverable, Packet, PacketType, Socket},
-    payload::Timestamp,
-};
 
 /// Basic server implementation that can handle multiple clients.
 pub struct Server {
-    socket: Socket,                     // The socket used for communication.
-    heartbeats: HashMap<Uuid, Instant>, // The last heartbeat received from each client.
+    socket: Socket,                    // The socket used for communication.
+    heartbeats: HashMap<u32, Instant>, // The last heartbeat received from each client.
 
     send_heartbeat: utils::Interval, // The interval for sending heartbeats to clients.
     check_heartbeat: utils::Interval, // The interval for checking client heartbeats.
@@ -33,23 +27,23 @@ impl Server {
             heartbeats: HashMap::new(),
 
             send_heartbeat: utils::Interval::start(Duration::from_secs(5), 0),
-            check_heartbeat: utils::Interval::start(Duration::from_secs(10), 0),
+            check_heartbeat: utils::Interval::start(Duration::from_secs(11), 0),
         }
     }
 
-    /// Obtains the UUID of the server.
+    /// Obtains the ID of the server.
     #[inline]
-    fn uuid(&self) -> Uuid {
-        self.socket.uuid()
+    fn id(&self) -> u32 {
+        self.socket.id()
     }
 
     /// Sends a packet to the client.
-    fn send(&mut self, packet_type: PacketType, dest: Uuid, payload: Option<&[u8]>) -> Result<()> {
-        if self.uuid() == dest {
+    fn send(&mut self, packet_type: PacketType, dest: u32, payload: Option<&[u8]>) -> Result<()> {
+        if self.id() == dest {
             bail!(ConnectionError::SelfConnection);
         }
 
-        let mut packet = Packet::new(packet_type, self.uuid());
+        let mut packet = Packet::new(packet_type, self.id());
         if let Some(data) = payload {
             packet.set_payload(data);
         }
@@ -58,10 +52,10 @@ impl Server {
     }
 
     /// Disconnects a client from the server and removes it from the list.
-    fn disconnect_client(&mut self, uuid: Uuid, notify: bool) -> Result<()> {
+    fn disconnect_client(&mut self, id: u32, notify: bool) -> Result<()> {
         // Remove the client from the list.
-        self.heartbeats.remove(&uuid);
-        self.socket.disconnect_client(uuid, notify)?;
+        self.heartbeats.remove(&id);
+        self.socket.disconnect_client(id, notify)?;
         Ok(())
     }
 
@@ -74,19 +68,10 @@ impl Server {
 
     /// Sends a heartbeat to all connected clients to check their status.
     fn send_heartbeat(&mut self) {
-        for uuid in self.socket.remote_uuids() {
-            let now = Timestamp(
-                Self::since_epoch().as_secs(),
-                Self::since_epoch().subsec_nanos(),
-            );
-
-            let payload = std::convert::Into::<Vec<u8>>::into(now);
-            if let Err(why) = self.send(PacketType::Heartbeat, uuid, Some(&payload)) {
-                debugln!(
-                    "SERVER: [{}] Failed to send heartbeat: {}",
-                    uuid.as_fields().0,
-                    why
-                );
+        for id in self.socket.remote_ids() {
+            let payload = Payload::Timestamp(true, Self::since_epoch()).as_bytes();
+            if let Err(why) = self.send(PacketType::Heartbeat, id, Some(&payload)) {
+                debugln!("SERVER: [{}] Failed to send heartbeat: {}", id, why);
             }
         }
     }
@@ -94,12 +79,12 @@ impl Server {
     /// Checks if the heartbeat has been received from each client within the disconnect delta.
     fn check_heartbeat(&mut self) {
         let now = Instant::now();
-        let mut disconnect: Vec<Uuid> = vec![];
+        let mut disconnect: Vec<u32> = vec![];
 
         // Remove clients from the list if the heartbeat has not been received within the disconnect delta.
-        self.heartbeats.retain(|uuid, last_heartbeat| {
+        self.heartbeats.retain(|id, last_heartbeat| {
             if now.duration_since(*last_heartbeat).as_millis() > Self::DISCONNECT_DELTA_MS {
-                disconnect.push(*uuid);
+                disconnect.push(*id);
                 false
             } else {
                 true
@@ -107,17 +92,10 @@ impl Server {
         });
 
         // Send a disconnect command to the client if the heartbeat has not been received.
-        for uuid in disconnect {
-            debugln!(
-                "SERVER: [{}] Heartbeat timeout. Disconnecting client.",
-                uuid.as_fields().0
-            );
-            if let Err(why) = self.disconnect_client(uuid, true) {
-                debugln!(
-                    "SERVER: [{}] Failed to disconnect client: {}",
-                    uuid.as_fields().0,
-                    why
-                );
+        for id in disconnect {
+            debugln!("SERVER: [{}] Heartbeat timeout. Disconnecting client.", id);
+            if let Err(why) = self.disconnect_client(id, true) {
+                debugln!("SERVER: [{}] Failed to disconnect client: {}", id, why);
             }
         }
     }
@@ -125,7 +103,8 @@ impl Server {
     /// Runs a single step of the server, processing incoming packets and sending heartbeats.
     #[inline]
     pub fn run_step(&mut self) -> Result<()> {
-        self.packet_processor()?;
+        // Process all incoming packets until none remain.
+        while self.packet_processor()?.is_some() {}
 
         if self.send_heartbeat.is_ready() {
             self.send_heartbeat();
@@ -140,17 +119,10 @@ impl Server {
         Ok(())
     }
 
-    /// Runs the server and handles incoming packets.
-    pub fn run(&mut self) -> Result<()> {
-        loop {
-            self.run_step()?;
-        }
-    }
-
     /// Processes incoming packets and handles their types.
-    fn packet_processor(&mut self) -> Result<()> {
+    fn packet_processor(&mut self) -> Result<Option<Packet>> {
         let Some(packet) = self.socket.try_recv()? else {
-            return Ok(());
+            return Ok(None);
         };
 
         match packet.get_type() {
@@ -158,29 +130,26 @@ impl Server {
                 if let Payload::String(payload) = Payload::from(&packet) {
                     debugln!(
                         "SERVER: [{}] Received error: {}",
-                        packet.get_short_id(),
+                        packet.get_sender(),
                         payload
                     );
                 }
             }
 
             PacketType::Acknowledge => {
-                debugln!("SERVER: [{}] Received acknowledge.", packet.get_short_id());
+                debugln!("SERVER: [{}] Received acknowledge.", packet.get_sender());
             }
 
             PacketType::Connect => {
-                debugln!("SERVER: [{}] Client is connecting.", packet.get_short_id());
-                self.heartbeats.insert(packet.get_source(), Instant::now());
-                let payload = Payload::Uuid(packet.get_source()).to_bytes();
-                self.send(PacketType::Connect, packet.get_source(), Some(&payload))?;
+                debugln!("SERVER: [{}] Client is connecting.", packet.get_sender());
+                self.heartbeats.insert(packet.get_sender(), Instant::now());
+                let payload = Payload::U32(packet.get_sender()).as_bytes();
+                self.send(PacketType::Connect, packet.get_sender(), Some(&payload))?;
             }
 
             PacketType::Disconnect => {
-                debugln!(
-                    "SERVER: Client [{}] is disconnecting.",
-                    packet.get_short_id(),
-                );
-                self.disconnect_client(packet.get_source(), false)?;
+                debugln!("SERVER: Client [{}] is disconnecting.", packet.get_sender(),);
+                self.disconnect_client(packet.get_sender(), false)?;
                 if self.socket.is_local() {
                     // Local sockets shut the server down on disconnect.
                     bail!(ConnectionError::Disconnected);
@@ -188,18 +157,22 @@ impl Server {
             }
 
             PacketType::Heartbeat => {
-                if let Some(ts) = self.heartbeats.get_mut(&packet.get_source()) {
+                if let Some(ts) = self.heartbeats.get_mut(&packet.get_sender()) {
                     *ts = Instant::now();
                 } else {
                     debugln!(
                         "SERVER: [{}] Client should be disconnected.",
-                        packet.get_short_id()
+                        packet.get_sender()
                     );
-                    self.disconnect_client(packet.get_source(), true)?;
-                    return Ok(());
+                    self.disconnect_client(packet.get_sender(), true)?;
+                    return Ok(None);
                 }
 
-                let ping = if let Payload::Timestamp(ts) = Payload::from(&packet) {
+                let ping = if let Payload::Timestamp(respond, ts) = Payload::from(&packet) {
+                    if respond {
+                        let payload = Payload::Timestamp(false, Self::since_epoch()).as_bytes();
+                        self.send(PacketType::Heartbeat, packet.get_sender(), Some(&payload))?;
+                    }
                     let total = Self::since_epoch() - ts;
                     format!(", ping: {total:?}")
                 } else {
@@ -208,7 +181,7 @@ impl Server {
 
                 debugln!(
                     "SERVER: [{}] Received heartbeat{}",
-                    packet.get_short_id(),
+                    packet.get_sender(),
                     ping,
                 );
             }
@@ -217,13 +190,13 @@ impl Server {
                 if let Payload::String(payload) = Payload::from(&packet) {
                     debugln!(
                         "SERVER: [{}] Received message: {}",
-                        packet.get_short_id(),
+                        packet.get_sender(),
                         payload
                     );
                 }
             }
         }
 
-        Ok(())
+        Ok(Some(packet))
     }
 }

@@ -1,20 +1,19 @@
 use std::time::Duration;
 
-use uuid::Uuid;
-
 use crate::net::{Packet, PacketType};
 
 /// Exmaple of a payload from a packet.
 pub enum Payload {
-    None,                // Represents an empty payload.
-    String(String),      // Represents a string payload.
-    Uuid(Uuid),          // Represents a UUID payload.
-    Timestamp(Duration), // Represents a timestamp payload.
+    None,                      // Represents an empty payload.
+    Error(u8, Option<String>), // Represents an error payload with a code and message.
+    String(String),            // Represents a string payload.
+    U32(u32),                  // Represents a 32-bit unsigned integer payload.
+    Timestamp(bool, Duration), // Represents a timestamp payload.
 }
 
 impl Payload {
     /// Converts the payload to a byte vector.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn as_bytes(&self) -> Vec<u8> {
         Vec::from(self)
     }
 }
@@ -27,21 +26,33 @@ impl From<&Packet> for Payload {
         }
 
         match value.get_type() {
-            PacketType::Error | PacketType::Message => {
-                Self::String(String::from_utf8_lossy(raw).to_string())
+            PacketType::Error => {
+                if raw.is_empty() {
+                    Self::None
+                } else {
+                    let code = raw[0];
+                    let message = if raw.len() > 1 {
+                        Some(String::from_utf8_lossy(&raw[1..]).to_string())
+                    } else {
+                        None
+                    };
+                    Self::Error(code, message)
+                }
             }
+            PacketType::Message => Self::String(String::from_utf8_lossy(raw).to_string()),
             PacketType::Connect => {
-                if raw.len() == 16 {
-                    let uuid = Uuid::from_slice(raw).unwrap();
-                    Self::Uuid(uuid)
+                if raw.len() == size_of::<u32>() {
+                    let id = u32::from_le_bytes(raw.try_into().unwrap());
+                    Self::U32(id)
                 } else {
                     Self::None
                 }
             }
             PacketType::Heartbeat => {
-                if raw.len() == 12 {
-                    let ts = Timestamp::from(raw);
-                    Self::Timestamp(Duration::from(&ts))
+                if raw.len() == size_of::<bool>() + size_of::<u64>() + size_of::<u32>() {
+                    let respond = raw[0] != 0;
+                    let ts = Timestamp::from(&raw[1..13]);
+                    Self::Timestamp(respond, Duration::from(&ts))
                 } else {
                     Self::None
                 }
@@ -51,28 +62,40 @@ impl From<&Packet> for Payload {
     }
 }
 
-impl From<Packet> for Payload {
-    fn from(value: Packet) -> Self {
-        Self::from(&value)
-    }
-}
-
 impl From<&Payload> for Vec<u8> {
     fn from(value: &Payload) -> Self {
         match value {
             Payload::None => vec![],
+            Payload::Error(code, message) => {
+                let mut bytes = vec![*code];
+                if let Some(msg) = message {
+                    bytes.extend_from_slice(msg.as_bytes());
+                }
+                bytes
+            }
             Payload::String(s) => s.as_bytes().to_vec(),
-            Payload::Uuid(uuid) => Vec::from(uuid.as_bytes()),
-            Payload::Timestamp(ts) => {
-                let ts = Timestamp(ts.as_secs(), ts.subsec_nanos());
-                Vec::from(ts)
+            Payload::U32(id) => Vec::from(&id.to_le_bytes()),
+            Payload::Timestamp(respond, ts) => {
+                let mut bytes = vec![u8::from(*respond)];
+                bytes.extend_from_slice(&Timestamp(ts.as_secs(), ts.subsec_nanos()).as_bytes());
+                bytes
             }
         }
     }
 }
 
 /// Represents a timestamp in seconds and nanoseconds. Essentially a Duration.
-pub struct Timestamp(pub u64, pub u32);
+struct Timestamp(pub u64, pub u32);
+
+impl Timestamp {
+    /// Converts the timestamp to a byte vector.
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; 12];
+        bytes[0..8].copy_from_slice(&self.0.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.1.to_be_bytes());
+        bytes
+    }
+}
 
 impl From<&[u8]> for Timestamp {
     fn from(value: &[u8]) -> Self {
@@ -85,14 +108,5 @@ impl From<&[u8]> for Timestamp {
 impl From<&Timestamp> for Duration {
     fn from(value: &Timestamp) -> Self {
         Duration::from_secs(value.0) + Duration::from_nanos(u64::from(value.1))
-    }
-}
-
-impl From<Timestamp> for Vec<u8> {
-    fn from(value: Timestamp) -> Self {
-        let mut bytes = vec![0; 12];
-        bytes[0..8].copy_from_slice(&value.0.to_be_bytes());
-        bytes[8..12].copy_from_slice(&value.1.to_be_bytes());
-        bytes
     }
 }
