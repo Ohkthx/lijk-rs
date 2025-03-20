@@ -1,3 +1,5 @@
+use anyhow::{Result, bail};
+
 /// Packet types for connections that can be sent.
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub enum PacketType {
@@ -9,42 +11,28 @@ pub enum PacketType {
     Message,      // Message packet, used to send a message to a server or client.
 }
 
-impl From<u8> for PacketType {
-    fn from(value: u8) -> Self {
-        match value {
+impl TryFrom<u8> for PacketType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        let packet_type = match value {
             0x00 => PacketType::Error,
             0x01 => PacketType::Acknowledge,
             0x02 => PacketType::Connect,
             0x03 => PacketType::Disconnect,
             0x04 => PacketType::Heartbeat,
             0x05 => PacketType::Message,
-            _ => panic!("Invalid packet type"),
-        }
+            _ => bail!("Unknown packet type: {}.", value),
+        };
+
+        Ok(packet_type)
     }
 }
 
 /// Error codes included in the `PacketType::Error` packet.
+#[derive(Debug)]
 pub enum PacketError {
     TooManyConnections = 0x01, // Too many connections.
-}
-
-/// A raw packet that can be sent over a connection.
-pub(crate) struct RawPacket {
-    data: Vec<u8>, // Raw data of the packet, including the header and payload.
-}
-
-impl RawPacket {
-    /// Validates the length of the raw packet to ensure it is at least the size of the header.
-    #[inline]
-    pub(crate) fn is_valid_len(&self) -> bool {
-        self.data.len() >= Packet::HEADER_SIZE
-    }
-
-    /// Obtains the underlying data of the raw packet.
-    #[inline]
-    pub(crate) fn get_data(&self) -> &[u8] {
-        &self.data
-    }
 }
 
 /// A packet that be sent over a connection.
@@ -120,69 +108,46 @@ impl Packet {
 
     /// Sets the payload of the packet.
     #[inline]
-    pub fn set_payload(&mut self, payload: &[u8]) {
-        self.payload = payload.to_vec();
-    }
-
-    /// Converts the packet into Vec<u8> for sending.
-    #[inline]
-    pub fn as_bytes(&self) -> Vec<u8> {
-        RawPacket::from(self).into()
+    pub fn set_payload<T: Into<Vec<u8>>>(&mut self, payload: T) {
+        self.payload = payload.into();
     }
 }
 
-impl From<Packet> for RawPacket {
-    fn from(packet: Packet) -> Self {
-        RawPacket::from(&packet)
-    }
-}
-
-impl From<&Packet> for RawPacket {
+impl From<&Packet> for Vec<u8> {
     fn from(packet: &Packet) -> Self {
-        let mut raw = vec![0; Packet::HEADER_SIZE + packet.get_payload().len()];
-        raw[0] = packet.get_version();
-        raw[1] = packet.get_type() as u8;
-        raw[2..6].copy_from_slice(&packet.get_sender().to_le_bytes());
-        raw[6..10].copy_from_slice(&packet.get_sequence().to_le_bytes());
-        raw[Packet::HEADER_SIZE..].copy_from_slice(packet.get_payload());
-
-        Self { data: raw }
+        let mut buffer = vec![0; Packet::HEADER_SIZE + packet.payload.len()];
+        buffer[0] = packet.version;
+        buffer[1] = packet.r#type as u8;
+        buffer[2..6].copy_from_slice(&packet.sender.to_be_bytes());
+        buffer[6..10].copy_from_slice(&packet.sequence.to_be_bytes());
+        buffer[Packet::HEADER_SIZE..].copy_from_slice(&packet.payload);
+        buffer
     }
 }
 
-impl From<RawPacket> for Packet {
-    fn from(value: RawPacket) -> Self {
-        let version = value.data[0];
-        let packet_type = PacketType::from(value.data[1]);
-        let sender = u32::from_le_bytes(value.data[2..6].try_into().expect("Invalid sender ID"));
-        let sequence = u32::from_le_bytes(value.data[6..10].try_into().expect("Invalid sequence"));
+impl TryFrom<&[u8]> for Packet {
+    type Error = anyhow::Error;
 
-        let payload = if value.is_valid_len() {
-            value.data[Self::HEADER_SIZE..].to_vec()
-        } else {
-            vec![]
-        };
+    fn try_from(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::HEADER_SIZE {
+            bail!("Packet is too short to include the full header.");
+        }
 
-        Self {
+        // Parse the header.
+        let version = bytes[0];
+        let packet_type = PacketType::try_from(bytes[1])?;
+        let sender = u32::from_be_bytes(bytes[2..6].try_into().unwrap());
+        let sequence = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
+
+        // Remainder is payload.
+        let payload = bytes[Self::HEADER_SIZE..].to_vec();
+
+        Ok(Self {
             version,
             r#type: packet_type,
             sender,
             sequence,
             payload,
-        }
-    }
-}
-
-impl From<RawPacket> for Vec<u8> {
-    fn from(value: RawPacket) -> Self {
-        value.data
-    }
-}
-
-impl From<&[u8]> for RawPacket {
-    fn from(value: &[u8]) -> Self {
-        Self {
-            data: value.to_vec(),
-        }
+        })
     }
 }

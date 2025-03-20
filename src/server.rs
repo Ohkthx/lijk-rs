@@ -38,7 +38,7 @@ impl Server {
     }
 
     /// Sends a packet to the client.
-    fn send(&mut self, packet_type: PacketType, dest: u32, payload: Option<&[u8]>) -> Result<()> {
+    fn send(&mut self, packet_type: PacketType, dest: u32, payload: Option<Payload>) -> Result<()> {
         if self.id() == dest {
             bail!(ConnectionError::SelfConnection);
         }
@@ -69,8 +69,8 @@ impl Server {
     /// Sends a heartbeat to all connected clients to check their status.
     fn send_heartbeat(&mut self) {
         for id in self.socket.remote_ids() {
-            let payload = Payload::Timestamp(true, Self::since_epoch()).as_bytes();
-            if let Err(why) = self.send(PacketType::Heartbeat, id, Some(&payload)) {
+            let payload = Payload::Timestamp(true, Self::since_epoch());
+            if let Err(why) = self.send(PacketType::Heartbeat, id, Some(payload)) {
                 debugln!("SERVER: [{}] Failed to send heartbeat: {}", id, why);
             }
         }
@@ -143,8 +143,8 @@ impl Server {
             PacketType::Connect => {
                 debugln!("SERVER: [{}] Client is connecting.", packet.get_sender());
                 self.heartbeats.insert(packet.get_sender(), Instant::now());
-                let payload = Payload::U32(packet.get_sender()).as_bytes();
-                self.send(PacketType::Connect, packet.get_sender(), Some(&payload))?;
+                let payload = Payload::U32(packet.get_sender());
+                self.send(PacketType::Connect, packet.get_sender(), Some(payload))?;
             }
 
             PacketType::Disconnect => {
@@ -170,8 +170,8 @@ impl Server {
 
                 let ping = if let Payload::Timestamp(respond, ts) = Payload::from(&packet) {
                     if respond {
-                        let payload = Payload::Timestamp(false, Self::since_epoch()).as_bytes();
-                        self.send(PacketType::Heartbeat, packet.get_sender(), Some(&payload))?;
+                        let payload = Payload::Timestamp(false, Self::since_epoch());
+                        self.send(PacketType::Heartbeat, packet.get_sender(), Some(payload))?;
                     }
                     let total = Self::since_epoch() - ts;
                     format!(", ping: {total:?}")

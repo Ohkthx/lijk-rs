@@ -133,7 +133,7 @@ impl LocalSocket {
                 const ID_SIZE: usize = size_of::<u32>();
                 let raw_id = packet.get_payload();
                 if raw_id.len() == ID_SIZE {
-                    self.id = u32::from_le_bytes(raw_id.try_into().map_err(|_| {
+                    self.id = u32::from_be_bytes(raw_id.try_into().map_err(|_| {
                         ConnectionError::InvalidPacketPayload(
                             "ID for Connection (Invalid)".to_string(),
                         )
@@ -185,7 +185,7 @@ impl SocketHandler for LocalSocket {
                             let mut packet = Packet::new(PacketType::Error, self.id);
                             let mut bytes = vec![PacketError::TooManyConnections as u8];
                             bytes.extend_from_slice("Too many connections".as_bytes());
-                            packet.set_payload(&bytes);
+                            packet.set_payload(bytes);
 
                             if let Some(tx) = &self.tx {
                                 let _ = tx.send(packet);
@@ -218,7 +218,7 @@ impl SocketHandler for LocalSocket {
                             let mut packet = Packet::new(PacketType::Error, self.id);
                             let mut bytes = vec![PacketError::TooManyConnections as u8];
                             bytes.extend_from_slice("Too many connections".as_bytes());
-                            packet.set_payload(&bytes);
+                            packet.set_payload(bytes);
 
                             if let Some(tx) = &self.tx {
                                 let _ = tx.send(packet);

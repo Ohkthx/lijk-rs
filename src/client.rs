@@ -45,7 +45,7 @@ impl Client {
     }
 
     /// Sends a packet to the server.
-    fn send(&mut self, packet_type: PacketType, payload: Option<&[u8]>) -> Result<()> {
+    fn send(&mut self, packet_type: PacketType, payload: Option<Payload>) -> Result<()> {
         let mut packet = Packet::new(packet_type, self.id());
 
         if let Some(data) = payload {
@@ -68,8 +68,8 @@ impl Client {
         let now = Instant::now();
         if now.duration_since(self.last_packet_ts).as_millis() > Self::RECONNECT_DELTA_MS {
             debugln!("CLIENT: [{}] Checking if server alive.", self.id());
-            let payload = Payload::Timestamp(true, Self::since_epoch()).as_bytes();
-            if let Err(why) = self.send(PacketType::Heartbeat, Some(&payload)) {
+            let payload = Payload::Timestamp(true, Self::since_epoch());
+            if let Err(why) = self.send(PacketType::Heartbeat, Some(payload)) {
                 debugln!("CLIENT: [{}] Failed to send heartbeat: {}", self.id(), why);
             }
         }
@@ -178,8 +178,8 @@ impl Client {
                 );
 
                 if respond {
-                    let payload = Payload::Timestamp(false, duration).as_bytes();
-                    let _ = self.send(PacketType::Heartbeat, Some(&payload));
+                    let payload = Payload::Timestamp(false, duration);
+                    let _ = self.send(PacketType::Heartbeat, Some(payload));
                 }
             }
 

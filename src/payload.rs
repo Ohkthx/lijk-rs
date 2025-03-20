@@ -11,13 +11,6 @@ pub enum Payload {
     Timestamp(bool, Duration), // Represents a timestamp payload.
 }
 
-impl Payload {
-    /// Converts the payload to a byte vector.
-    pub fn as_bytes(&self) -> Vec<u8> {
-        Vec::from(self)
-    }
-}
-
 impl From<&Packet> for Payload {
     fn from(value: &Packet) -> Self {
         let raw = value.get_payload();
@@ -42,7 +35,7 @@ impl From<&Packet> for Payload {
             PacketType::Message => Self::String(String::from_utf8_lossy(raw).to_string()),
             PacketType::Connect => {
                 if raw.len() == size_of::<u32>() {
-                    let id = u32::from_le_bytes(raw.try_into().unwrap());
+                    let id = u32::from_be_bytes(raw.try_into().unwrap());
                     Self::U32(id)
                 } else {
                     Self::None
@@ -74,13 +67,19 @@ impl From<&Payload> for Vec<u8> {
                 bytes
             }
             Payload::String(s) => s.as_bytes().to_vec(),
-            Payload::U32(id) => Vec::from(&id.to_le_bytes()),
+            Payload::U32(id) => Vec::from(&id.to_be_bytes()),
             Payload::Timestamp(respond, ts) => {
                 let mut bytes = vec![u8::from(*respond)];
                 bytes.extend_from_slice(&Timestamp(ts.as_secs(), ts.subsec_nanos()).as_bytes());
                 bytes
             }
         }
+    }
+}
+
+impl From<Payload> for Vec<u8> {
+    fn from(value: Payload) -> Self {
+        Vec::from(&value)
     }
 }
 

@@ -43,8 +43,8 @@ pub enum ConnectionError {
     InvalidPacketSender(u32, u32),        // Packet Sender ID is invalid.
     InvalidPacketAddress(String, String), // Packet address is invalid.
     InvalidPacketVersion(u8),             // Packet version is invalid.
-    InvalidPacketLength(usize),           // Packet length is invalid.
     InvalidPacketPayload(String),         // Packet payload is invalid.
+    InvalidPacket(usize, usize, String),  // Packet is invalid.
     SocketError(String),                  // Socket error occurred.
 }
 
@@ -75,14 +75,14 @@ impl std::fmt::Display for ConnectionError {
                 Packet::VERSION,
                 version
             ),
-            ConnectionError::InvalidPacketLength(size) => write!(
-                f,
-                "Invalid Packet Length, expected {}, got {}",
-                Packet::HEADER_SIZE,
-                size
-            ),
             ConnectionError::InvalidPacketPayload(expected) => {
                 write!(f, "Invalid Packet Payload, expected {expected}")
+            }
+            ConnectionError::InvalidPacket(expected, got, reason) => {
+                write!(
+                    f,
+                    "Invalid Packet, minimum size {expected}, got {got}, reason: {reason}"
+                )
             }
             ConnectionError::SocketError(why) => write!(f, "Socket Error: {why}"),
         }

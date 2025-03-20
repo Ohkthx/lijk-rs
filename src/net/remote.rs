@@ -4,15 +4,14 @@ use anyhow::{Result, bail};
 
 use crate::net::PacketError;
 
-use super::packet::RawPacket;
 use super::socket::SocketHandler;
 use super::storage::ClientStorage;
 use super::{ConnectionError, Deliverable, INVALID_CLIENT_ID, Packet, PacketType, SERVER_ID};
 
 /// Remote connection that uses UDP to communicate with a remote server or client.
 pub(crate) struct RemoteSocket {
-    socket: UdpSocket, // Raw socket.
-    id: u32,
+    socket: UdpSocket,           // Raw socket.
+    id: u32,                     // ID of the connection.
     local_addr: String,          // Local address for the socket.
     remote_addr: Option<String>, // Remote address for the socket. Only set for clients.
 
@@ -189,7 +188,7 @@ impl RemoteSocket {
             const ID_SIZE: usize = size_of::<u32>();
             let raw_id = packet.get_payload();
             if raw_id.len() == ID_SIZE {
-                self.id = u32::from_le_bytes(raw_id.try_into().map_err(|_| {
+                self.id = u32::from_be_bytes(raw_id.try_into().map_err(|_| {
                     ConnectionError::InvalidPacketPayload("ID for Connection (Invalid)".to_string())
                 })?);
                 self.clients.insert(packet.get_sender(), sender);
@@ -216,13 +215,12 @@ impl SocketHandler for RemoteSocket {
             };
         }
 
-        let raw: RawPacket = packet.into();
         if let Some(address) = &self.remote_addr {
             // Send to the host / server.
-            self.socket.send_to(raw.get_data(), address)?;
+            self.socket.send_to(&Vec::from(&packet), address)?;
         } else if let Some(addr) = self.clients.get_addr(to) {
             // Send to a client.
-            self.socket.send_to(raw.get_data(), addr)?;
+            self.socket.send_to(&Vec::from(&packet), addr)?;
         } else {
             bail!(ConnectionError::NotConnected);
         }
@@ -238,12 +236,15 @@ impl SocketHandler for RemoteSocket {
 
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
-                let raw = RawPacket::from(&self.buffer[..size]);
-                if !raw.is_valid_len() {
-                    bail!(ConnectionError::InvalidPacketLength(raw.get_data().len()));
-                }
+                let mut packet = match Packet::try_from(&self.buffer[..size]) {
+                    Ok(packet) => packet,
+                    Err(why) => bail!(ConnectionError::InvalidPacket(
+                        Packet::HEADER_SIZE,
+                        size,
+                        why.to_string()
+                    )),
+                };
 
-                let mut packet = raw.into();
                 if let Err(why) = self.validate_packet(sender, &mut packet) {
                     if let Some(ConnectionError::TooManyConnections) =
                         why.downcast_ref::<ConnectionError>()
@@ -251,8 +252,8 @@ impl SocketHandler for RemoteSocket {
                         let mut packet = Packet::new(PacketType::Error, self.id);
                         let mut bytes = vec![PacketError::TooManyConnections as u8];
                         bytes.extend_from_slice("Too many connections".as_bytes());
-                        packet.set_payload(&bytes);
-                        self.socket.send_to(&packet.as_bytes(), sender)?;
+                        packet.set_payload(bytes);
+                        self.socket.send_to(&Vec::from(&packet), sender)?;
                         return Ok(None);
                     }
 
@@ -277,12 +278,15 @@ impl SocketHandler for RemoteSocket {
 
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
-                let raw = RawPacket::from(&self.buffer[..size]);
-                if !raw.is_valid_len() {
-                    bail!(ConnectionError::InvalidPacketLength(raw.get_data().len()));
-                }
+                let mut packet = match Packet::try_from(&self.buffer[..size]) {
+                    Ok(packet) => packet,
+                    Err(why) => bail!(ConnectionError::InvalidPacket(
+                        Packet::HEADER_SIZE,
+                        size,
+                        why.to_string()
+                    )),
+                };
 
-                let mut packet = raw.into();
                 if let Err(why) = self.validate_packet(sender, &mut packet) {
                     if let Some(ConnectionError::TooManyConnections) =
                         why.downcast_ref::<ConnectionError>()
@@ -290,8 +294,8 @@ impl SocketHandler for RemoteSocket {
                         let mut packet = Packet::new(PacketType::Error, self.id);
                         let mut bytes = vec![PacketError::TooManyConnections as u8];
                         bytes.extend_from_slice("Too many connections".as_bytes());
-                        packet.set_payload(&bytes);
-                        self.socket.send_to(&packet.as_bytes(), sender)?;
+                        packet.set_payload(bytes);
+                        self.socket.send_to(&Vec::from(&packet), sender)?;
                         return Ok(None);
                     }
 
