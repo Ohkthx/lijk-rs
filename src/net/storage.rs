@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
-
-use crate::{net::ConnectionError, utils::SparseSet};
+use crate::utils::SparseSet;
 
 /// Information about the clients connected to the server.
 pub(crate) struct ClientStorage<T> {
@@ -69,7 +67,8 @@ where
     }
 
     /// Adds a client to the storage. Returns the Client ID assigned.
-    pub(crate) fn add(&mut self, addr: T) -> Result<u32> {
+    /// Returns `Self::INVALID_CLIENT_ID` if the maximum number of clients has been reached.
+    pub(crate) fn add(&mut self, addr: T) -> u32 {
         let client_id = if let Some(id) = self.pool.pop() {
             // Reuse an ID from the pool.
             id
@@ -81,13 +80,13 @@ where
         if (client_id == Self::INVALID_CLIENT_ID || client_id >= self.max_clients)
             && self.pool.is_empty()
         {
-            bail!(ConnectionError::TooManyConnections)
+            return Self::INVALID_CLIENT_ID;
         }
 
         self.addr_id.insert(addr, client_id);
         self.addr.insert(client_id, addr);
         self.sequence.insert(client_id, 0);
-        Ok(client_id + self.id_offset)
+        client_id + self.id_offset
     }
 
     /// Obtains the IDs and Socket Addresses of all clients.

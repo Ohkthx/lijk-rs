@@ -1,8 +1,8 @@
-use anyhow::{Result, bail};
+use crate::flee;
 
-use crate::net::{ConnectionError, PacketType};
-
-use super::{Deliverable, INVALID_CLIENT_ID, LocalSocket, Packet, RemoteSocket};
+use super::{
+    Deliverable, INVALID_CLIENT_ID, LocalSocket, NetError, Packet, PacketType, RemoteSocket, Result,
+};
 
 /// Socket type for the connection. Either a remote or local connection.
 enum SocketType {
@@ -118,9 +118,16 @@ impl Socket {
     }
 
     /// Disconnects a client from the server and notifies the client if requested.
+    ///
+    /// # Errors
+    ///
+    /// - `NetError::NotServer` if the socket is not in server mode.
+    /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
+    /// - `NetError::NotConnected` if the connection is not established.
+    /// - `NetError::SocketError` if there is a socket error.
     pub fn disconnect_client(&mut self, client_id: u32, notify: bool) -> Result<()> {
         if !self.is_server() {
-            bail!(ConnectionError::NotServer);
+            flee!(NetError::NotServer);
         }
 
         match &mut self.socket {
@@ -130,10 +137,16 @@ impl Socket {
     }
 
     /// Sends a packet to the destination UUID. If the packet is a connect packet, it will not check for self connection.
+    ///
+    /// # Errors
+    ///
+    /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
+    /// - `NetError::NotConnected` if the connection is not established.
+    /// - `NetError::SocketError` if there is a socket error.
     #[allow(dead_code)]
     pub fn send(&mut self, deliverable: Deliverable) -> Result<()> {
         if self.id() == deliverable.to && deliverable.packet.get_type() != PacketType::Connect {
-            bail!(ConnectionError::SelfConnection);
+            flee!(NetError::SelfConnection);
         }
 
         match &mut self.socket {
@@ -143,6 +156,16 @@ impl Socket {
     }
 
     /// Tries to receive a packet from the connection. Returns None if no packet is available.
+    ///
+    /// # Errors
+    ///
+    /// - `NetError::InvalidPacket` if the header length, version, or packet type is incorrect.
+    /// - `NetError::InvalidPacketSender` if the sender ID is invalid.
+    /// - `NetError::InvalidPacketAddress` if the address is invalid.
+    /// - `NetError::InvalidPacketPayload` if the payload is invalid.
+    /// - `NetError::NotConnected` if the connection is not established.
+    /// - `NetError::SocketError` occurs if cannot toggle nonblocking mode or unknown error.
+    /// - `NetError::Disconnected` if the connection is disconnected.
     #[allow(dead_code)]
     pub fn try_recv(&mut self) -> Result<Option<Packet>> {
         match &mut self.socket {
@@ -152,6 +175,16 @@ impl Socket {
     }
 
     /// Waits to receive a packet from the connection. Returns an error if a connection issue occurs.
+    ///
+    /// # Errors
+    ///
+    /// - `NetError::InvalidPacket` if the header length, version, or packet type is incorrect.
+    /// - `NetError::InvalidPacketSender` if the sender ID is invalid.
+    /// - `NetError::InvalidPacketAddress` if the address is invalid.
+    /// - `NetError::InvalidPacketPayload` if the payload is invalid.
+    /// - `NetError::NotConnected` if the connection is not established.
+    /// - `NetError::SocketError` occurs if cannot toggle nonblocking mode or unknown error.
+    /// - `NetError::Disconnected` if the connection is disconnected.
     #[allow(dead_code)]
     pub fn recv(&mut self) -> Result<Option<Packet>> {
         match &mut self.socket {

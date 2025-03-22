@@ -1,12 +1,12 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
-use anyhow::{Result, bail};
-
-use crate::net::PacketError;
+use crate::flee;
 
 use super::socket::SocketHandler;
 use super::storage::ClientStorage;
-use super::{ConnectionError, Deliverable, INVALID_CLIENT_ID, Packet, PacketType, SERVER_ID};
+use super::{
+    Deliverable, ErrorPacket, INVALID_CLIENT_ID, NetError, Packet, PacketType, Result, SERVER_ID,
+};
 
 /// Remote connection that uses UDP to communicate with a remote server or client.
 pub(crate) struct RemoteSocket {
@@ -40,7 +40,7 @@ impl RemoteSocket {
         // Bind the socket to the address.
         let socket = match UdpSocket::bind(bind_addr) {
             Ok(socket) => socket,
-            Err(why) => bail!(ConnectionError::SocketError(why.to_string())),
+            Err(why) => flee!(NetError::SocketError(why.to_string())),
         };
 
         let mut connection = Self {
@@ -96,7 +96,7 @@ impl RemoteSocket {
         self.nonblocking = !self.nonblocking;
         if let Err(why) = self.socket.set_nonblocking(self.nonblocking) {
             self.nonblocking = !self.nonblocking; // Reset if an error occurs.
-            bail!(ConnectionError::SocketError(why.to_string()));
+            flee!(NetError::SocketError(why.to_string()));
         }
 
         Ok(())
@@ -104,7 +104,12 @@ impl RemoteSocket {
 
     /// Adds a new client, returning the client's ID.
     fn add_client(&mut self, addr: SocketAddr) -> Result<u32> {
-        self.clients.add(addr)
+        let client_id = self.clients.add(addr);
+        if client_id == INVALID_CLIENT_ID {
+            flee!(NetError::TooManyConnections);
+        }
+
+        Ok(client_id)
     }
 
     /// Removes a client from the address and ID maps.
@@ -128,10 +133,6 @@ impl RemoteSocket {
 
     /// Validates the packet to ensure it is signed with the appropriate ID to Address.
     fn validate_packet(&mut self, sender: SocketAddr, packet: &mut Packet) -> Result<()> {
-        if packet.get_version() != Packet::VERSION {
-            bail!(ConnectionError::InvalidPacketVersion(packet.get_version()));
-        }
-
         let mut authed = !self.is_server();
 
         if packet.get_sender() == INVALID_CLIENT_ID {
@@ -146,7 +147,7 @@ impl RemoteSocket {
                 authed = true;
             } else {
                 // Client is not authenticated. Never sent connect packet.
-                bail!(ConnectionError::AuthenticationFailed);
+                flee!(NetError::NotConnected(self.is_server()));
             }
         }
 
@@ -157,10 +158,7 @@ impl RemoteSocket {
                 authed = packet.get_sender() == id;
                 if !authed {
                     // ID does not match address.
-                    bail!(ConnectionError::InvalidPacketSender(
-                        id,
-                        packet.get_sender()
-                    ));
+                    flee!(NetError::InvalidPacketSender(id, packet.get_sender()));
                 }
             }
 
@@ -171,14 +169,14 @@ impl RemoteSocket {
                     authed = sender == *cached;
                     if !authed {
                         // Address does not match ID.
-                        bail!(ConnectionError::InvalidPacketAddress(
+                        flee!(NetError::InvalidPacketAddress(
                             cached.to_string(),
                             sender.to_string(),
                         ));
                     }
                 } else {
                     // Socket Address and ID are not in the cache.
-                    bail!(ConnectionError::AuthenticationFailed);
+                    flee!(NetError::NotConnected(self.is_server()));
                 }
             }
         }
@@ -189,11 +187,11 @@ impl RemoteSocket {
             let raw_id = packet.get_payload();
             if raw_id.len() == ID_SIZE {
                 self.id = u32::from_be_bytes(raw_id.try_into().map_err(|_| {
-                    ConnectionError::InvalidPacketPayload("ID for Connection (Invalid)".to_string())
+                    NetError::InvalidPacketPayload("ID for Connection (Invalid)".to_string())
                 })?);
                 self.clients.insert(packet.get_sender(), sender);
             } else {
-                bail!(ConnectionError::InvalidPacketPayload(
+                flee!(NetError::InvalidPacketPayload(
                     "ID for Connection (Missing)".to_string()
                 ));
             }
@@ -201,28 +199,93 @@ impl RemoteSocket {
 
         Ok(())
     }
+
+    /// Parses a packet from the buffer and the errors associated with it.
+    fn parse_packet(&self, size: usize, sender: &SocketAddr) -> Result<Packet> {
+        match Packet::try_from(&self.buffer[..size]) {
+            Ok(packet) => Ok(packet),
+            Err(NetError::InvalidPacketVersion(ex, got)) => {
+                self.send_err(
+                    sender,
+                    ErrorPacket::InvalidPacketVersion,
+                    &format!("Expected version: {ex}, got: {got}"),
+                )?;
+                flee!(NetError::InvalidPacket(
+                    Some(usize::from(ex)),
+                    usize::from(got),
+                    "Invalid Packet Version".to_string()
+                ))
+            }
+            Err(NetError::InvalidPacketSize(ex, got)) => {
+                self.send_err(
+                    sender,
+                    ErrorPacket::InvalidPacketSize,
+                    &format!("Expected minimum size: {ex}, got: {got}"),
+                )?;
+                flee!(NetError::InvalidPacket(
+                    Some(ex),
+                    got,
+                    "Invalid Packet Size".to_string()
+                ))
+            }
+            Err(NetError::InvalidPacketType(value)) => {
+                self.send_err(
+                    sender,
+                    ErrorPacket::InvalidPacketType,
+                    &format!("Packet type got: {value}"),
+                )?;
+                flee!(NetError::InvalidPacket(
+                    None,
+                    usize::from(value),
+                    "Invalid Packet Type".to_string()
+                ))
+            }
+            Err(why) => flee!(why),
+        }
+    }
+
+    /// Wraps the `send_to` method to send a packet to a specific address.
+    fn send_to<T: ToSocketAddrs>(&self, packet: &Packet, addr: &T) -> Result<()> {
+        if let Err(why) = self.socket.send_to(&Vec::from(packet), addr) {
+            flee!(NetError::SocketError(format!(
+                "Unable to send packet: {why}",
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Sends an error packet to the specified address.
+    fn send_err(&self, sender: &SocketAddr, error: ErrorPacket, msg: &str) -> Result<()> {
+        let mut packet = Packet::new(PacketType::Error, self.id);
+        let mut bytes = vec![error as u8];
+        bytes.extend_from_slice(msg.as_bytes());
+        packet.set_payload(bytes);
+        self.send_to(&packet, &sender)?;
+        Ok(())
+    }
 }
 
 impl SocketHandler for RemoteSocket {
     #[inline]
     fn send(&mut self, Deliverable { to, mut packet }: Deliverable) -> Result<()> {
-        if !(packet.get_sender() == INVALID_CLIENT_ID && packet.get_type() == PacketType::Connect) {
+        if packet.get_sender() != INVALID_CLIENT_ID || packet.get_type() != PacketType::Connect {
             if let Some(seq) = self.clients.get_sequence_mut(to) {
                 *seq += 1;
                 packet.set_sequence(*seq);
             } else {
-                bail!(ConnectionError::AuthenticationFailed);
+                flee!(NetError::NotConnected(self.is_server()));
             };
         }
 
         if let Some(address) = &self.remote_addr {
             // Send to the host / server.
-            self.socket.send_to(&Vec::from(&packet), address)?;
+            self.send_to(&packet, address)?;
         } else if let Some(addr) = self.clients.get_addr(to) {
             // Send to a client.
-            self.socket.send_to(&Vec::from(&packet), addr)?;
+            self.send_to(&packet, addr)?;
         } else {
-            bail!(ConnectionError::NotConnected);
+            flee!(NetError::NotConnected(self.is_server()));
         }
 
         Ok(())
@@ -236,28 +299,19 @@ impl SocketHandler for RemoteSocket {
 
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
-                let mut packet = match Packet::try_from(&self.buffer[..size]) {
-                    Ok(packet) => packet,
-                    Err(why) => bail!(ConnectionError::InvalidPacket(
-                        Packet::HEADER_SIZE,
-                        size,
-                        why.to_string()
-                    )),
-                };
-
+                // Parse the packet and validate it.
+                let mut packet = self.parse_packet(size, &sender)?;
                 if let Err(why) = self.validate_packet(sender, &mut packet) {
-                    if let Some(ConnectionError::TooManyConnections) =
-                        why.downcast_ref::<ConnectionError>()
-                    {
-                        let mut packet = Packet::new(PacketType::Error, self.id);
-                        let mut bytes = vec![PacketError::TooManyConnections as u8];
-                        bytes.extend_from_slice("Too many connections".as_bytes());
-                        packet.set_payload(bytes);
-                        self.socket.send_to(&Vec::from(&packet), sender)?;
+                    if why == NetError::TooManyConnections {
+                        self.send_err(
+                            &sender,
+                            ErrorPacket::TooManyConnections,
+                            "Too many connections",
+                        )?;
                         return Ok(None);
                     }
 
-                    bail!(why);
+                    flee!(why);
                 }
 
                 Ok(Some(packet))
@@ -266,7 +320,7 @@ impl SocketHandler for RemoteSocket {
                 // No data available, return None.
                 Ok(None)
             }
-            Err(why) => bail!(ConnectionError::SocketError(why.to_string())),
+            Err(why) => flee!(NetError::SocketError(why.to_string())),
         }
     }
 
@@ -278,33 +332,24 @@ impl SocketHandler for RemoteSocket {
 
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
-                let mut packet = match Packet::try_from(&self.buffer[..size]) {
-                    Ok(packet) => packet,
-                    Err(why) => bail!(ConnectionError::InvalidPacket(
-                        Packet::HEADER_SIZE,
-                        size,
-                        why.to_string()
-                    )),
-                };
-
+                // Parse the packet and validate it.
+                let mut packet = self.parse_packet(size, &sender)?;
                 if let Err(why) = self.validate_packet(sender, &mut packet) {
-                    if let Some(ConnectionError::TooManyConnections) =
-                        why.downcast_ref::<ConnectionError>()
-                    {
-                        let mut packet = Packet::new(PacketType::Error, self.id);
-                        let mut bytes = vec![PacketError::TooManyConnections as u8];
-                        bytes.extend_from_slice("Too many connections".as_bytes());
-                        packet.set_payload(bytes);
-                        self.socket.send_to(&Vec::from(&packet), sender)?;
+                    if why == NetError::TooManyConnections {
+                        self.send_err(
+                            &sender,
+                            ErrorPacket::TooManyConnections,
+                            "Too many connections",
+                        )?;
                         return Ok(None);
                     }
 
-                    bail!(why);
+                    flee!(why);
                 }
 
                 Ok(Some(packet))
             }
-            Err(why) => bail!(ConnectionError::SocketError(why.to_string())),
+            Err(why) => flee!(NetError::SocketError(why.to_string())),
         }
     }
 }

@@ -1,12 +1,11 @@
 use std::sync::mpsc;
 
-use anyhow::{Result, bail};
-
-use crate::net::PacketError;
+use crate::flee;
+use crate::net::ErrorPacket;
 
 use super::socket::SocketHandler;
 use super::storage::ClientStorage;
-use super::{ConnectionError, Deliverable, INVALID_CLIENT_ID, Packet, PacketType, SERVER_ID};
+use super::{Deliverable, INVALID_CLIENT_ID, NetError, Packet, PacketType, Result, SERVER_ID};
 
 /// Local connection that uses MPSC to communicate locally.
 pub(crate) struct LocalSocket {
@@ -45,7 +44,7 @@ impl LocalSocket {
     /// Creates the receiver for the connection.
     pub(crate) fn create_rx(&mut self) -> Result<mpsc::Receiver<Packet>> {
         if self.tx.is_some() {
-            bail!(ConnectionError::DuplicateConnection);
+            flee!(NetError::DuplicateConnection);
         }
 
         let (tx, rx) = mpsc::channel::<Packet>();
@@ -56,7 +55,7 @@ impl LocalSocket {
     /// Sets the receiver for the connection.
     pub(crate) fn set_rx(&mut self, rx: mpsc::Receiver<Packet>) -> Result<()> {
         if self.rx.is_some() {
-            bail!(ConnectionError::DuplicateConnection);
+            flee!(NetError::DuplicateConnection);
         }
 
         self.rx = Some(rx);
@@ -95,7 +94,12 @@ impl LocalSocket {
 
     /// Adds a new client, returning the client's ID.
     fn add_client(&mut self, addr: u32) -> Result<u32> {
-        self.clients.add(addr)
+        let client_id = self.clients.add(addr);
+        if client_id == INVALID_CLIENT_ID {
+            flee!(NetError::TooManyConnections);
+        }
+
+        Ok(client_id)
     }
 
     /// Removes the client from the server.
@@ -134,18 +138,31 @@ impl LocalSocket {
                 let raw_id = packet.get_payload();
                 if raw_id.len() == ID_SIZE {
                     self.id = u32::from_be_bytes(raw_id.try_into().map_err(|_| {
-                        ConnectionError::InvalidPacketPayload(
-                            "ID for Connection (Invalid)".to_string(),
-                        )
+                        NetError::InvalidPacketPayload("ID for Connection (Invalid)".to_string())
                     })?);
                     self.clients
                         .insert(packet.get_sender(), packet.get_sender());
                 } else {
-                    bail!(ConnectionError::InvalidPacketPayload(
+                    flee!(NetError::InvalidPacketPayload(
                         "ID for Connection (Missing)".to_string()
                     ));
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Sends an error packet via the socket.
+    fn send_err(&self, error: ErrorPacket, msg: &str) -> Result<()> {
+        if let Some(sender) = &self.tx {
+            let mut packet = Packet::new(PacketType::Error, self.id);
+            let mut bytes = vec![error as u8];
+            bytes.extend_from_slice(msg.as_bytes());
+            packet.set_payload(bytes);
+            sender
+                .send(packet)
+                .map_err(|_| NetError::SocketError("Failed to send error packet".to_string()))?;
         }
 
         Ok(())
@@ -155,19 +172,19 @@ impl LocalSocket {
 impl SocketHandler for LocalSocket {
     #[inline]
     fn send(&mut self, Deliverable { to, mut packet, .. }: Deliverable) -> Result<()> {
-        if !(packet.get_sender() == INVALID_CLIENT_ID && packet.get_type() == PacketType::Connect) {
+        if packet.get_sender() != INVALID_CLIENT_ID || packet.get_type() != PacketType::Connect {
             if let Some(seq) = self.clients.get_sequence_mut(to) {
                 *seq += 1;
                 packet.set_sequence(*seq);
             } else {
-                bail!(ConnectionError::NotConnected);
+                flee!(NetError::NotConnected(self.is_server()));
             };
         }
 
         if let Some(tx) = &self.tx {
             let _ = tx.send(packet);
         } else {
-            bail!(ConnectionError::NotConnected);
+            flee!(NetError::NotConnected(self.is_server()));
         }
 
         Ok(())
@@ -179,30 +196,21 @@ impl SocketHandler for LocalSocket {
             match rx.try_recv() {
                 Ok(mut packet) => {
                     if let Err(why) = self.validate_packet(&mut packet) {
-                        if let Some(ConnectionError::TooManyConnections) =
-                            why.downcast_ref::<ConnectionError>()
-                        {
-                            let mut packet = Packet::new(PacketType::Error, self.id);
-                            let mut bytes = vec![PacketError::TooManyConnections as u8];
-                            bytes.extend_from_slice("Too many connections".as_bytes());
-                            packet.set_payload(bytes);
-
-                            if let Some(tx) = &self.tx {
-                                let _ = tx.send(packet);
-                            }
+                        if why == NetError::TooManyConnections {
+                            self.send_err(ErrorPacket::TooManyConnections, "Too many connections")?;
                             return Ok(None);
                         }
 
-                        bail!(why);
+                        flee!(why);
                     }
 
                     Ok(Some(packet))
                 }
                 Err(mpsc::TryRecvError::Empty) => Ok(None),
-                Err(mpsc::TryRecvError::Disconnected) => bail!(ConnectionError::Disconnected),
+                Err(mpsc::TryRecvError::Disconnected) => flee!(NetError::Disconnected),
             }
         } else {
-            bail!(ConnectionError::NotConnected);
+            flee!(NetError::NotConnected(self.is_server()));
         }
     }
 
@@ -212,29 +220,20 @@ impl SocketHandler for LocalSocket {
             match rx.recv() {
                 Ok(mut packet) => {
                     if let Err(why) = self.validate_packet(&mut packet) {
-                        if let Some(ConnectionError::TooManyConnections) =
-                            why.downcast_ref::<ConnectionError>()
-                        {
-                            let mut packet = Packet::new(PacketType::Error, self.id);
-                            let mut bytes = vec![PacketError::TooManyConnections as u8];
-                            bytes.extend_from_slice("Too many connections".as_bytes());
-                            packet.set_payload(bytes);
-
-                            if let Some(tx) = &self.tx {
-                                let _ = tx.send(packet);
-                            }
+                        if why == NetError::TooManyConnections {
+                            self.send_err(ErrorPacket::TooManyConnections, "Too many connections")?;
                             return Ok(None);
                         }
 
-                        bail!(why);
+                        flee!(why);
                     }
 
                     Ok(Some(packet))
                 }
-                Err(_) => bail!(ConnectionError::Disconnected),
+                Err(_) => flee!(NetError::Disconnected),
             }
         } else {
-            bail!(ConnectionError::NotConnected);
+            flee!(NetError::NotConnected(self.is_server()));
         }
     }
 }

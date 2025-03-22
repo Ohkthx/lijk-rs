@@ -1,10 +1,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Result, bail};
-
-use crate::net::{ConnectionError, Deliverable, Packet, PacketType, Socket};
+use crate::error::AppError;
+use crate::net::{Deliverable, NetError, Packet, PacketType, Socket};
 use crate::payload::Payload;
-use crate::{debugln, utils};
+use crate::{Result, debugln, flee, utils};
 
 /// Basic client implementation that connects to a server.
 pub struct Client {
@@ -47,13 +46,18 @@ impl Client {
     /// Sends a packet to the server.
     fn send(&mut self, packet_type: PacketType, payload: Option<Payload>) -> Result<()> {
         let mut packet = Packet::new(packet_type, self.id());
-
         if let Some(data) = payload {
             packet.set_payload(data);
         }
 
-        self.socket.send(Deliverable::new(self.server, packet))?;
-        Ok(())
+        match self.socket.send(Deliverable::new(self.server, packet)) {
+            Ok(()) => Ok(()),
+            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why))),
+            Err(why) => {
+                debugln!("CLIENT: Failed to send packet to server: {}", why);
+                Ok(())
+            }
+        }
     }
 
     /// Duration since the epoch.
@@ -79,7 +83,7 @@ impl Client {
     fn check_timeout(&mut self) -> Result<()> {
         let now = Instant::now();
         if now.duration_since(self.last_packet_ts).as_millis() > Self::TIMEOUT_DELTA_MS {
-            bail!(ConnectionError::Timeout);
+            flee!(AppError::NetError(NetError::Timeout));
         }
 
         Ok(())
@@ -99,9 +103,9 @@ impl Client {
 
         // Check if a connection was never established.
         if retry_count >= Self::MAX_CONNECTION_RETRY {
-            bail!(ConnectionError::Timeout);
+            flee!(AppError::NetError(NetError::Timeout));
         } else if self.server == Socket::INVALID_CLIENT_ID {
-            bail!(ConnectionError::NotConnected);
+            flee!(AppError::NetError(NetError::NotConnected(false)));
         }
 
         Ok(())
@@ -125,8 +129,14 @@ impl Client {
 
     /// Processes incoming packets and handles different packet types.
     fn packet_processor(&mut self) -> Result<Option<Packet>> {
-        let Some(packet) = self.socket.try_recv()? else {
-            return Ok(None);
+        let packet = match self.socket.try_recv() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return Ok(None),
+            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why)))?,
+            Err(why) => {
+                debugln!("CLIENT: Obtaining packet error: {}", why);
+                return Ok(None);
+            }
         };
 
         // Update the last packet received timestamp.
@@ -160,27 +170,31 @@ impl Client {
                     self.send(PacketType::Disconnect, None)?;
                 }
 
-                bail!(ConnectionError::Disconnected);
+                flee!(AppError::NetError(NetError::Disconnected));
             }
 
             PacketType::Heartbeat => {
-                let Payload::Timestamp(respond, duration) = Payload::from(&packet) else {
-                    bail!(ConnectionError::InvalidPacketPayload(
-                        "Timestamp for Heartbeat (Missing)".to_string()
-                    ));
+                match Payload::from(&packet) {
+                    Payload::Timestamp(respond, duration) => {
+                        self.server_ts_offset = Self::since_epoch() - duration;
+                        debugln!(
+                            "CLIENT: [{}] Received heartbeat, ping: {:?}",
+                            self.id(),
+                            self.server_ts_offset
+                        );
+
+                        if respond {
+                            let payload = Payload::Timestamp(false, duration);
+                            let _ = self.send(PacketType::Heartbeat, Some(payload));
+                        }
+                    }
+                    _ => {
+                        debugln!(
+                            "CLIENT: [{}] Received invalid heartbeat packet: missing timestamp.",
+                            self.id()
+                        );
+                    }
                 };
-
-                self.server_ts_offset = Self::since_epoch() - duration;
-                debugln!(
-                    "CLIENT: [{}] Received heartbeat, ping: {:?}",
-                    self.id(),
-                    self.server_ts_offset
-                );
-
-                if respond {
-                    let payload = Payload::Timestamp(false, duration);
-                    let _ = self.send(PacketType::Heartbeat, Some(payload));
-                }
             }
 
             PacketType::Message => {

@@ -32,4 +32,3 @@ rpath = false
 
 
 [dependencies]
-anyhow = "1"

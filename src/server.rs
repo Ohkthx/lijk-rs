@@ -1,11 +1,10 @@
 use ::std::collections::HashMap;
 use ::std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Result, bail};
-
-use crate::net::{Deliverable, Packet, PacketType, Socket};
-use crate::{debugln, utils};
-use crate::{net::ConnectionError, payload::Payload};
+use crate::error::{AppError, Result};
+use crate::net::{Deliverable, NetError, Packet, PacketType, Socket};
+use crate::payload::Payload;
+use crate::{debugln, flee, utils};
 
 /// Basic server implementation that can handle multiple clients.
 pub struct Server {
@@ -39,24 +38,37 @@ impl Server {
 
     /// Sends a packet to the client.
     fn send(&mut self, packet_type: PacketType, dest: u32, payload: Option<Payload>) -> Result<()> {
-        if self.id() == dest {
-            bail!(ConnectionError::SelfConnection);
-        }
-
         let mut packet = Packet::new(packet_type, self.id());
         if let Some(data) = payload {
             packet.set_payload(data);
         }
 
-        self.socket.send(Deliverable::new(dest, packet))
+        match self.socket.send(Deliverable::new(dest, packet)) {
+            Ok(()) => Ok(()),
+            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why))),
+            Err(why) => {
+                debugln!(
+                    "SERVER: Failed to send packet to client [{}]: {}",
+                    dest,
+                    why
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Disconnects a client from the server and removes it from the list.
     fn disconnect_client(&mut self, id: u32, notify: bool) -> Result<()> {
         // Remove the client from the list.
         self.heartbeats.remove(&id);
-        self.socket.disconnect_client(id, notify)?;
-        Ok(())
+        match self.socket.disconnect_client(id, notify) {
+            Ok(()) => Ok(()),
+            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why))),
+            Err(why) => {
+                debugln!("SERVER: Error while disconnecting client [{}]: {}", id, why);
+                Ok(())
+            }
+        }
     }
 
     /// Duration since the epoch.
@@ -121,8 +133,14 @@ impl Server {
 
     /// Processes incoming packets and handles their types.
     fn packet_processor(&mut self) -> Result<Option<Packet>> {
-        let Some(packet) = self.socket.try_recv()? else {
-            return Ok(None);
+        let packet = match self.socket.try_recv() {
+            Ok(Some(packet)) => packet,
+            Ok(None) | Err(NetError::InvalidPacket(..)) => return Ok(None),
+            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why)))?,
+            Err(why) => {
+                debugln!("SERVER: Failed to receive packet: {}", why);
+                return Ok(None);
+            }
         };
 
         match packet.get_type() {
@@ -152,7 +170,7 @@ impl Server {
                 self.disconnect_client(packet.get_sender(), false)?;
                 if self.socket.is_local() {
                     // Local sockets shut the server down on disconnect.
-                    bail!(ConnectionError::Disconnected);
+                    flee!(AppError::NetError(NetError::Disconnected));
                 }
             }
 

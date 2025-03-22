@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use crate::flee;
+
+use super::{NetError, Result};
 
 /// Packet types for connections that can be sent.
 #[derive(PartialEq, Copy, Clone, Debug)]
@@ -12,9 +14,9 @@ pub enum PacketType {
 }
 
 impl TryFrom<u8> for PacketType {
-    type Error = anyhow::Error;
+    type Error = u8;
 
-    fn try_from(value: u8) -> Result<Self> {
+    fn try_from(value: u8) -> std::result::Result<Self, u8> {
         let packet_type = match value {
             0x00 => PacketType::Error,
             0x01 => PacketType::Acknowledge,
@@ -22,17 +24,11 @@ impl TryFrom<u8> for PacketType {
             0x03 => PacketType::Disconnect,
             0x04 => PacketType::Heartbeat,
             0x05 => PacketType::Message,
-            _ => bail!("Unknown packet type: {}.", value),
+            _ => flee!(value),
         };
 
         Ok(packet_type)
     }
-}
-
-/// Error codes included in the `PacketType::Error` packet.
-#[derive(Debug)]
-pub enum PacketError {
-    TooManyConnections = 0x01, // Too many connections.
 }
 
 /// A packet that be sent over a connection.
@@ -126,16 +122,21 @@ impl From<&Packet> for Vec<u8> {
 }
 
 impl TryFrom<&[u8]> for Packet {
-    type Error = anyhow::Error;
+    type Error = NetError;
 
     fn try_from(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < Self::HEADER_SIZE {
-            bail!("Packet is too short to include the full header.");
+            flee!(NetError::InvalidPacketSize(Self::HEADER_SIZE, bytes.len(),));
         }
 
         // Parse the header.
         let version = bytes[0];
-        let packet_type = PacketType::try_from(bytes[1])?;
+        if version != Self::VERSION {
+            flee!(NetError::InvalidPacketVersion(Self::VERSION, version));
+        }
+
+        let packet_type = PacketType::try_from(bytes[1]).map_err(NetError::InvalidPacketType)?;
+
         let sender = u32::from_be_bytes(bytes[2..6].try_into().unwrap());
         let sequence = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
 

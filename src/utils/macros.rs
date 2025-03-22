@@ -6,3 +6,11 @@ macro_rules! debugln {
         println!(concat!("[DEBUG] ", $fmt), $($($arg)*)?);
     };
 }
+
+/// Short form for returning an `Error` within a `Result` function.
+#[macro_export]
+macro_rules! flee {
+    ($err:expr) => {
+        return Err($err)
+    };
+}
