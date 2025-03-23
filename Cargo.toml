@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 debug_output = []
+shared_ip = []    # Allow multiple clients from same IP if different ports.
 
 [profile.dev]
 opt-level = 1

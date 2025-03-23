@@ -91,7 +91,7 @@ fn as_solo(args: &[String]) -> Result<()> {
     let (sconn, cconn) = if args.contains(&Flags::Remote.to_string()) {
         // Initialize the remote connections.
         let server = Socket::new_remote(None).map_err(AppError::NetError)?;
-        let server_addr = server.address().to_string();
+        let server_addr = server.addr().to_string();
         let client = Socket::new_remote(Some(server_addr)).map_err(AppError::NetError)?;
         (server, client)
     } else if args.contains(&Flags::Local.to_string()) {

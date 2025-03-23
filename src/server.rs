@@ -2,14 +2,14 @@ use ::std::collections::HashMap;
 use ::std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{AppError, Result};
-use crate::net::{Deliverable, NetError, Packet, PacketType, Socket};
+use crate::net::{Deliverable, EntityId, NetError, Packet, PacketLabel, Socket};
 use crate::payload::Payload;
 use crate::{debugln, flee, utils};
 
 /// Basic server implementation that can handle multiple clients.
 pub struct Server {
-    socket: Socket,                    // The socket used for communication.
-    heartbeats: HashMap<u32, Instant>, // The last heartbeat received from each client.
+    socket: Socket,                         // The socket used for communication.
+    heartbeats: HashMap<EntityId, Instant>, // The last heartbeat received from each client.
 
     send_heartbeat: utils::Interval, // The interval for sending heartbeats to clients.
     check_heartbeat: utils::Interval, // The interval for checking client heartbeats.
@@ -32,12 +32,17 @@ impl Server {
 
     /// Obtains the ID of the server.
     #[inline]
-    fn id(&self) -> u32 {
+    fn id(&self) -> EntityId {
         self.socket.id()
     }
 
     /// Sends a packet to the client.
-    fn send(&mut self, packet_type: PacketType, dest: u32, payload: Option<Payload>) -> Result<()> {
+    fn send(
+        &mut self,
+        packet_type: PacketLabel,
+        dest: EntityId,
+        payload: Option<Payload>,
+    ) -> Result<()> {
         let mut packet = Packet::new(packet_type, self.id());
         if let Some(data) = payload {
             packet.set_payload(data);
@@ -58,7 +63,7 @@ impl Server {
     }
 
     /// Disconnects a client from the server and removes it from the list.
-    fn disconnect_client(&mut self, id: u32, notify: bool) -> Result<()> {
+    fn disconnect_client(&mut self, id: EntityId, notify: bool) -> Result<()> {
         // Remove the client from the list.
         self.heartbeats.remove(&id);
         match self.socket.disconnect_client(id, notify) {
@@ -82,7 +87,7 @@ impl Server {
     fn send_heartbeat(&mut self) {
         for id in self.socket.remote_ids() {
             let payload = Payload::Timestamp(true, Self::since_epoch());
-            if let Err(why) = self.send(PacketType::Heartbeat, id, Some(payload)) {
+            if let Err(why) = self.send(PacketLabel::Heartbeat, id, Some(payload)) {
                 debugln!("SERVER: [{}] Failed to send heartbeat: {}", id, why);
             }
         }
@@ -91,7 +96,7 @@ impl Server {
     /// Checks if the heartbeat has been received from each client within the disconnect delta.
     fn check_heartbeat(&mut self) {
         let now = Instant::now();
-        let mut disconnect: Vec<u32> = vec![];
+        let mut disconnect: Vec<EntityId> = vec![];
 
         // Remove clients from the list if the heartbeat has not been received within the disconnect delta.
         self.heartbeats.retain(|id, last_heartbeat| {
@@ -143,53 +148,49 @@ impl Server {
             }
         };
 
-        match packet.get_type() {
-            PacketType::Error => {
+        match packet.label() {
+            PacketLabel::Error => {
                 if let Payload::String(payload) = Payload::from(&packet) {
-                    debugln!(
-                        "SERVER: [{}] Received error: {}",
-                        packet.get_sender(),
-                        payload
-                    );
+                    debugln!("SERVER: [{}] Received error: {}", packet.sender(), payload);
                 }
             }
 
-            PacketType::Acknowledge => {
-                debugln!("SERVER: [{}] Received acknowledge.", packet.get_sender());
+            PacketLabel::Acknowledge => {
+                debugln!("SERVER: [{}] Received acknowledge.", packet.sender());
             }
 
-            PacketType::Connect => {
-                debugln!("SERVER: [{}] Client is connecting.", packet.get_sender());
-                self.heartbeats.insert(packet.get_sender(), Instant::now());
-                let payload = Payload::U32(packet.get_sender());
-                self.send(PacketType::Connect, packet.get_sender(), Some(payload))?;
+            PacketLabel::Connect => {
+                debugln!("SERVER: [{}] Client is connecting.", packet.sender());
+                self.heartbeats.insert(packet.sender(), Instant::now());
+                let payload = Payload::U16(packet.sender());
+                self.send(PacketLabel::Connect, packet.sender(), Some(payload))?;
             }
 
-            PacketType::Disconnect => {
-                debugln!("SERVER: Client [{}] is disconnecting.", packet.get_sender(),);
-                self.disconnect_client(packet.get_sender(), false)?;
-                if self.socket.is_local() {
+            PacketLabel::Disconnect => {
+                debugln!("SERVER: Client [{}] is disconnecting.", packet.sender(),);
+                self.disconnect_client(packet.sender(), false)?;
+                if !self.socket.is_remote() {
                     // Local sockets shut the server down on disconnect.
                     flee!(AppError::NetError(NetError::Disconnected));
                 }
             }
 
-            PacketType::Heartbeat => {
-                if let Some(ts) = self.heartbeats.get_mut(&packet.get_sender()) {
+            PacketLabel::Heartbeat => {
+                if let Some(ts) = self.heartbeats.get_mut(&packet.sender()) {
                     *ts = Instant::now();
                 } else {
                     debugln!(
                         "SERVER: [{}] Client should be disconnected.",
-                        packet.get_sender()
+                        packet.sender()
                     );
-                    self.disconnect_client(packet.get_sender(), true)?;
+                    self.disconnect_client(packet.sender(), true)?;
                     return Ok(None);
                 }
 
                 let ping = if let Payload::Timestamp(respond, ts) = Payload::from(&packet) {
                     if respond {
                         let payload = Payload::Timestamp(false, Self::since_epoch());
-                        self.send(PacketType::Heartbeat, packet.get_sender(), Some(payload))?;
+                        self.send(PacketLabel::Heartbeat, packet.sender(), Some(payload))?;
                     }
                     let total = Self::since_epoch() - ts;
                     format!(", ping: {total:?}")
@@ -197,21 +198,25 @@ impl Server {
                     String::new()
                 };
 
-                debugln!(
-                    "SERVER: [{}] Received heartbeat{}",
-                    packet.get_sender(),
-                    ping,
-                );
+                debugln!("SERVER: [{}] Received heartbeat{}", packet.sender(), ping,);
             }
 
-            PacketType::Message => {
+            PacketLabel::Message => {
                 if let Payload::String(payload) = Payload::from(&packet) {
                     debugln!(
                         "SERVER: [{}] Received message: {}",
-                        packet.get_sender(),
+                        packet.sender(),
                         payload
                     );
                 }
+            }
+
+            PacketLabel::Unknown => {
+                debugln!(
+                    "SERVER: [{}] Received unknown packet label: {:?}.",
+                    packet.sender(),
+                    packet.label()
+                );
             }
         }
 

@@ -1,84 +1,88 @@
+use super::{ClientAddr, EntityId};
+
 /// Result type for network actions.
 pub(crate) type Result<T> = std::result::Result<T, NetError>;
 
-/// Error codes included in the `PacketType::Error` packet.
-#[derive(Debug)]
+/// Error codes included in the `PacketLabel::Error` packet.
+#[derive(Debug, PartialEq)]
 pub enum ErrorPacket {
     TooManyConnections = 0x01, // Too many connections.
     InvalidPacketVersion,      // Invalid packet version.
     InvalidPacketSize,         // Invalid packet size.
-    InvalidPacketType,         // Invalid packet type.
+    InvalidPacketLabel,        // Invalid packet label.
+}
+
+impl std::fmt::Display for ErrorPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorPacket::TooManyConnections => write!(f, "Too many connections"),
+            ErrorPacket::InvalidPacketVersion => write!(f, "Invalid packet version"),
+            ErrorPacket::InvalidPacketSize => write!(f, "Invalid packet size"),
+            ErrorPacket::InvalidPacketLabel => write!(f, "Invalid packet label"),
+        }
+    }
 }
 
 /// Error codes for various connection actions.
 #[derive(Debug, PartialEq)]
 pub enum NetError {
-    DuplicateConnection,                         // Connection already exists.
-    NotServer,                                   // Connection is not a server.
-    NotConnected(bool),                          // Non-existing connection, bool: is_server.
-    Disconnected,                                // Connection is disconnected.
-    Timeout,                                     // Connection timed out.
-    SelfConnection,                              // Connection to self is not allowed.
-    TooManyConnections,                          // Too many connections.
-    InvalidPacketSender(u32, u32),               // Packet Sender ID is invalid.
-    InvalidPacketAddress(String, String),        // Packet address is invalid.
-    InvalidPacketPayload(String),                // Packet payload is invalid.
-    InvalidPacket(Option<usize>, usize, String), // Packet is invalid.
-    InvalidPacketVersion(u8, u8),                // Packet version is invalid.
-    InvalidPacketSize(usize, usize),             // Packet header is invalid.
-    InvalidPacketType(u8),                       // Packet type is invalid.
-    SocketError(String),                         // Socket error occurred.
+    DuplicateConnection,                              // Connection already exists.
+    NotServer,                                        // Connection is not a server.
+    NotConnected(ClientAddr, bool),                   // Non-existing connection.
+    Disconnected,                                     // Connection is disconnected.
+    Timeout,                                          // Connection timed out.
+    SelfConnection,                                   // Connection to self is not allowed.
+    TooManyConnections,                               // Too many connections.
+    StorageError(String),                             // Error in storage.
+    InvalidServerAddress(String),                     // Server is invalid.
+    SocketError(String),                              // Socket error occurred.
+    InvalidPacketSender(EntityId, EntityId),          // Packet Sender ID is invalid.
+    InvalidPacketAddress(String, String),             // Packet address is invalid.
+    InvalidPacketPayload(String),                     // Packet payload is invalid.
+    InvalidPacket(ErrorPacket, Option<usize>, usize), // Packet is invalid.
 }
 
 impl std::fmt::Display for NetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetError::DuplicateConnection => write!(f, "Duplicate Connection"),
-            NetError::NotServer => write!(f, "Socket is not a Server"),
-            NetError::Disconnected => write!(f, "Disconnected"),
-            NetError::Timeout => write!(f, "Connection Timeout"),
-            NetError::SelfConnection => write!(f, "Self Connection is not allowed"),
-            NetError::TooManyConnections => write!(f, "Too Many Connections"),
-            NetError::NotConnected(is_server) => {
-                if *is_server {
-                    write!(f, "Not connect to server.")
+            NetError::DuplicateConnection => write!(f, "duplicate connection"),
+            NetError::NotServer => write!(f, "socket is not a server"),
+            NetError::Disconnected => write!(f, "disconnected"),
+            NetError::Timeout => write!(f, "connection timeout"),
+            NetError::SelfConnection => write!(f, "self connection is not allowed"),
+            NetError::TooManyConnections => write!(f, "too many connections"),
+            NetError::StorageError(why) => write!(f, "storage experienced {why}"),
+            NetError::InvalidServerAddress(addr) => write!(f, "invalid server address: {addr}"),
+            NetError::SocketError(why) => write!(f, "socket error: {why}"),
+            NetError::NotConnected(client, is_remote) => {
+                if *is_remote {
+                    write!(f, "not connected to destination {client}")
                 } else {
-                    write!(f, "Client is not connected / authenticated.")
+                    write!(f, "not connected from {client}")
                 }
             }
             NetError::InvalidPacketSender(expected, got) => {
                 write!(
                     f,
-                    "Invalid Packet Sender ID, expected {expected}, got {got}"
+                    "invalid packet sender ID, expected {expected}, got {got}"
                 )
             }
             NetError::InvalidPacketAddress(expected, got) => {
-                write!(f, "Invalid Packet Address, expected {expected}, got {got}")
+                write!(f, "invalid packet address, expected {expected}, got {got}")
             }
             NetError::InvalidPacketPayload(expected) => {
-                write!(f, "Invalid Packet Payload, expected {expected}")
+                write!(f, "invalid packet payload, expected {expected}")
             }
-            NetError::InvalidPacket(expected, got, reason) => {
+            NetError::InvalidPacket(error, expected, got) => {
                 if let Some(expected) = expected {
                     write!(
                         f,
-                        "Invalid Packet, expected {expected}, got {got}, reason: {reason}"
+                        "invalid packet, expected {expected}, got {got}, reason: {error}"
                     )
                 } else {
-                    write!(f, "Invalid Packet, got {got}, reason: {reason}")
+                    write!(f, "invalid packet, got {got}, reason: {error}")
                 }
             }
-            NetError::InvalidPacketVersion(expected, got) => {
-                write!(f, "Invalid Packet Version, expected {expected}, got {got}")
-            }
-            NetError::InvalidPacketSize(expected, got) => {
-                write!(
-                    f,
-                    "Invalid Packet Size, minimum size expected {expected}, got {got}"
-                )
-            }
-            NetError::InvalidPacketType(got) => write!(f, "Invalid Packet Type: {got}"),
-            NetError::SocketError(why) => write!(f, "Socket Error: {why}"),
         }
     }
 }

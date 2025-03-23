@@ -1,25 +1,25 @@
 use std::time::Duration;
 
-use crate::net::{Packet, PacketType};
+use crate::net::{Packet, PacketLabel};
 
 /// Exmaple of a payload from a packet.
 pub enum Payload {
     None,                      // Represents an empty payload.
     Error(u8, Option<String>), // Represents an error payload with a code and message.
     String(String),            // Represents a string payload.
-    U32(u32),                  // Represents a 32-bit unsigned integer payload.
+    U16(u16),                  // Represents a 32-bit unsigned integer payload.
     Timestamp(bool, Duration), // Represents a timestamp payload.
 }
 
 impl From<&Packet> for Payload {
     fn from(value: &Packet) -> Self {
-        let raw = value.get_payload();
+        let raw = value.payload();
         if raw.is_empty() {
             return Self::None;
         }
 
-        match value.get_type() {
-            PacketType::Error => {
+        match value.label() {
+            PacketLabel::Error => {
                 if raw.is_empty() {
                     Self::None
                 } else {
@@ -32,16 +32,16 @@ impl From<&Packet> for Payload {
                     Self::Error(code, message)
                 }
             }
-            PacketType::Message => Self::String(String::from_utf8_lossy(raw).to_string()),
-            PacketType::Connect => {
+            PacketLabel::Message => Self::String(String::from_utf8_lossy(raw).to_string()),
+            PacketLabel::Connect => {
                 if raw.len() == size_of::<u32>() {
-                    let id = u32::from_be_bytes(raw.try_into().unwrap());
-                    Self::U32(id)
+                    let id = u16::from_be_bytes(raw.try_into().unwrap());
+                    Self::U16(id)
                 } else {
                     Self::None
                 }
             }
-            PacketType::Heartbeat => {
+            PacketLabel::Heartbeat => {
                 if raw.len() == size_of::<bool>() + size_of::<u64>() + size_of::<u32>() {
                     let respond = raw[0] != 0;
                     let ts = Timestamp::from(&raw[1..13]);
@@ -67,7 +67,7 @@ impl From<&Payload> for Vec<u8> {
                 bytes
             }
             Payload::String(s) => s.as_bytes().to_vec(),
-            Payload::U32(id) => Vec::from(&id.to_be_bytes()),
+            Payload::U16(id) => Vec::from(&id.to_be_bytes()),
             Payload::Timestamp(respond, ts) => {
                 let mut bytes = vec![u8::from(*respond)];
                 bytes.extend_from_slice(&Timestamp(ts.as_secs(), ts.subsec_nanos()).as_bytes());
