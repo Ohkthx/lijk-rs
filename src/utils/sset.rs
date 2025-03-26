@@ -124,8 +124,7 @@ impl<T> SparseSet<T> {
     }
 
     /// Removes all values that match the predicate `f`.
-    #[allow(dead_code)]
-    pub fn extract_if<F>(&mut self, mut f: F) -> impl Iterator<Item = (usize, T)>
+    pub fn drain_if<F>(&mut self, mut f: F) -> impl Iterator<Item = (usize, T)>
     where
         F: FnMut(&T) -> bool,
     {

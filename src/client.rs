@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::AppError;
-use crate::net::{Deliverable, EntityId, INVALID_CLIENT_ID, NetError, Packet, PacketLabel, Socket};
+use crate::net::{
+    Deliverable, EntityId, ErrorPacket, INVALID_CLIENT_ID, NetError, Packet, PacketLabel, Socket,
+};
 use crate::payload::Payload;
 use crate::{Result, debugln, flee, utils};
 
@@ -11,9 +13,9 @@ pub struct Client {
     server: EntityId,           // The ID of the server to connect to.
     server_ts_offset: Duration, // The offset between the server and client timestamps.
 
-    last_packet_ts: Instant,         // The last time a packet was received.
-    send_heartbeat: utils::Interval, // The interval for sending heartbeats to the server.
-    check_timeout: utils::Interval,  // The interval for checking if the client timed out.
+    last_packet_ts: Instant,     // The last time a packet was received.
+    send_heartbeat: utils::Task, // The interval for sending heartbeats to the server.
+    check_timeout: utils::Task,  // The interval for checking if the client timed out.
 }
 
 impl Client {
@@ -32,8 +34,8 @@ impl Client {
             server_ts_offset: Duration::from_secs(0),
 
             last_packet_ts: Instant::now(),
-            send_heartbeat: utils::Interval::start(Duration::from_secs(10), 0),
-            check_timeout: utils::Interval::start(Duration::from_secs(5), 0),
+            send_heartbeat: utils::Task::start(Duration::from_secs(10), 0),
+            check_timeout: utils::Task::start(Duration::from_secs(5), 0),
         }
     }
 
@@ -146,6 +148,9 @@ impl Client {
             PacketLabel::Error => {
                 if let Payload::Error(code, Some(msg)) = Payload::from(&packet) {
                     debugln!("CLIENT: [{}] Received error [{}]: {}", self.id(), code, msg);
+                    if code == ErrorPacket::TooManyConnections {
+                        flee!(AppError::NetError(NetError::TooManyConnections));
+                    }
                 }
             }
 

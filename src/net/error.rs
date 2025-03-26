@@ -4,12 +4,30 @@ use super::{ClientAddr, EntityId};
 pub(crate) type Result<T> = std::result::Result<T, NetError>;
 
 /// Error codes included in the `PacketLabel::Error` packet.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum ErrorPacket {
     TooManyConnections = 0x01, // Too many connections.
     InvalidPacketVersion,      // Invalid packet version.
     InvalidPacketSize,         // Invalid packet size.
     InvalidPacketLabel,        // Invalid packet label.
+    Unknown,                   // Unknown error.
+}
+impl From<ErrorPacket> for u8 {
+    fn from(label: ErrorPacket) -> Self {
+        label as u8
+    }
+}
+
+impl From<u8> for ErrorPacket {
+    fn from(value: u8) -> Self {
+        match value {
+            0x01 => ErrorPacket::TooManyConnections,
+            0x02 => ErrorPacket::InvalidPacketVersion,
+            0x03 => ErrorPacket::InvalidPacketSize,
+            0x04 => ErrorPacket::InvalidPacketLabel,
+            _ => ErrorPacket::Unknown,
+        }
+    }
 }
 
 impl std::fmt::Display for ErrorPacket {
@@ -19,6 +37,7 @@ impl std::fmt::Display for ErrorPacket {
             ErrorPacket::InvalidPacketVersion => write!(f, "Invalid packet version"),
             ErrorPacket::InvalidPacketSize => write!(f, "Invalid packet size"),
             ErrorPacket::InvalidPacketLabel => write!(f, "Invalid packet label"),
+            ErrorPacket::Unknown => write!(f, "Unknown error"),
         }
     }
 }
@@ -26,6 +45,7 @@ impl std::fmt::Display for ErrorPacket {
 /// Error codes for various connection actions.
 #[derive(Debug, PartialEq)]
 pub enum NetError {
+    NothingToDo,                                      // No action needed.
     DuplicateConnection,                              // Connection already exists.
     NotServer,                                        // Connection is not a server.
     NotConnected(ClientAddr, bool),                   // Non-existing connection.
@@ -45,6 +65,7 @@ pub enum NetError {
 impl std::fmt::Display for NetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NetError::NothingToDo => write!(f, "nothing to do"),
             NetError::DuplicateConnection => write!(f, "duplicate connection"),
             NetError::NotServer => write!(f, "socket is not a server"),
             NetError::Disconnected => write!(f, "disconnected"),

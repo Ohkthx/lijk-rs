@@ -11,8 +11,8 @@ pub struct Server {
     socket: Socket,                         // The socket used for communication.
     heartbeats: HashMap<EntityId, Instant>, // The last heartbeat received from each client.
 
-    send_heartbeat: utils::Interval, // The interval for sending heartbeats to clients.
-    check_heartbeat: utils::Interval, // The interval for checking client heartbeats.
+    send_heartbeat: utils::Task, // The interval for sending heartbeats to clients.
+    check_heartbeat: utils::Task, // The interval for checking client heartbeats.
 }
 
 impl Server {
@@ -25,8 +25,8 @@ impl Server {
             socket: connection,
             heartbeats: HashMap::new(),
 
-            send_heartbeat: utils::Interval::start(Duration::from_secs(5), 0),
-            check_heartbeat: utils::Interval::start(Duration::from_secs(11), 0),
+            send_heartbeat: utils::Task::start(Duration::from_secs(5), 0),
+            check_heartbeat: utils::Task::start(Duration::from_secs(11), 0),
         }
     }
 
@@ -133,6 +133,8 @@ impl Server {
             self.check_heartbeat.reset();
         }
 
+        self.socket.run_tasks();
+
         Ok(())
     }
 
@@ -140,7 +142,7 @@ impl Server {
     fn packet_processor(&mut self) -> Result<Option<Packet>> {
         let packet = match self.socket.try_recv() {
             Ok(Some(packet)) => packet,
-            Ok(None) | Err(NetError::InvalidPacket(..)) => return Ok(None),
+            Ok(None) | Err(NetError::InvalidPacket(..) | NetError::NothingToDo) => return Ok(None),
             Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why)))?,
             Err(why) => {
                 debugln!("SERVER: Failed to receive packet: {}", why);

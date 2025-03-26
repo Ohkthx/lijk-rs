@@ -1,14 +1,14 @@
 use std::time::Duration;
 
-use crate::net::{Packet, PacketLabel};
+use crate::net::{ErrorPacket, Packet, PacketLabel};
 
 /// Exmaple of a payload from a packet.
 pub enum Payload {
-    None,                      // Represents an empty payload.
-    Error(u8, Option<String>), // Represents an error payload with a code and message.
-    String(String),            // Represents a string payload.
-    U16(u16),                  // Represents a 32-bit unsigned integer payload.
-    Timestamp(bool, Duration), // Represents a timestamp payload.
+    None,                               // Represents an empty payload.
+    Error(ErrorPacket, Option<String>), // Represents an error payload with a code and message.
+    String(String),                     // Represents a string payload.
+    U16(u16),                           // Represents a 32-bit unsigned integer payload.
+    Timestamp(bool, Duration),          // Represents a timestamp payload.
 }
 
 impl From<&Packet> for Payload {
@@ -23,7 +23,7 @@ impl From<&Packet> for Payload {
                 if raw.is_empty() {
                     Self::None
                 } else {
-                    let code = raw[0];
+                    let code = ErrorPacket::from(raw[0]);
                     let message = if raw.len() > 1 {
                         Some(String::from_utf8_lossy(&raw[1..]).to_string())
                     } else {
@@ -60,7 +60,7 @@ impl From<&Payload> for Vec<u8> {
         match value {
             Payload::None => vec![],
             Payload::Error(code, message) => {
-                let mut bytes = vec![*code];
+                let mut bytes = vec![u8::from(*code)];
                 if let Some(msg) = message {
                     bytes.extend_from_slice(msg.as_bytes());
                 }

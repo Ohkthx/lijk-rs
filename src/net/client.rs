@@ -47,7 +47,10 @@ impl std::fmt::Display for ClientAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientAddr::Local(id) => write!(f, "Local({id})"),
+            #[cfg(feature = "shared_ip")]
             ClientAddr::Ip(ip, port) => write!(f, "Ip({ip}, {port})"),
+            #[cfg(not(feature = "shared_ip"))]
+            ClientAddr::Ip(ip, _) => write!(f, "Ip({ip})"),
         }
     }
 }

@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
 /// A utility for managing time intervals in a loop.
-pub struct Interval {
+pub struct Task {
     next: Instant,      // The next time the interval should be checked.
     duration: Duration, // The duration of the interval.
 }
 
-impl Interval {
+impl Task {
     /// Creates a new interval with the specified duration and an initial delay.
     pub fn start(duration: Duration, delay_ms: u64) -> Self {
         Self {

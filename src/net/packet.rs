@@ -46,7 +46,7 @@ impl From<PacketLabel> for LabelType {
 }
 
 impl From<LabelType> for PacketLabel {
-    fn from(value: LabelType) -> PacketLabel {
+    fn from(value: LabelType) -> Self {
         match value {
             0x00 => PacketLabel::Error,
             0x01 => PacketLabel::Acknowledge,

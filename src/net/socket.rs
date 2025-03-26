@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use std::str::FromStr;
+use std::{net::SocketAddr, time::Duration};
 
-use crate::flee;
+use crate::{flee, utils::Task};
 
 use super::{
     ClientAddr, ClientStorage, Deliverable, EntityId, ErrorPacket, INVALID_CLIENT_ID, LocalSocket,
@@ -56,10 +56,11 @@ impl SocketHandler for SocketType {
 /// Socket for the connection. Used to send and receive packets to a client / server.
 /// This is a unified interface for both local and remote connections.
 pub struct Socket {
-    id: EntityId,                    // Unique identifier for the connection.
+    id: EntityId,                       // Unique identifier for the connection.
     server_addr: Option<ClientAddr>, // The server address for the connection. Only set for clients.
-    raw: SocketType, // The socket type for the connection. Either a remote or local connection.
-    clients: ClientStorage<ClientAddr>,
+    raw: SocketType,                 // Lower level socket type for the connection.
+    clients: ClientStorage<ClientAddr>, // Storage for the clients connected to the socket.
+    task_runner: Task,               // Task runner for managing tasks.
 }
 
 impl Socket {
@@ -86,6 +87,7 @@ impl Socket {
             server_addr,
             raw: socket,
             clients,
+            task_runner: Task::start(Duration::from_millis(1000), 0),
         })
     }
 
@@ -179,13 +181,31 @@ impl Socket {
         match self.clients.add(client) {
             Ok(client_id) => Ok(client_id),
             Err(StorageError::AtCapacity) => flee!(NetError::TooManyConnections),
+            Err(StorageError::ClientExists) => {
+                self.send_err_raw(
+                    &client,
+                    ErrorPacket::TooManyConnections,
+                    "Only one connection per IP allowed.",
+                )?;
+                flee!(NetError::NothingToDo);
+            }
             Err(why) => flee!(NetError::StorageError(why.to_string())),
         }
     }
 
+    /// Checks for any tasks that need to be run for the clients.
+    pub(crate) fn run_tasks(&mut self) {
+        if !self.task_runner.is_ready() {
+            return;
+        }
+
+        self.clients.run_tasks();
+        self.task_runner.reset();
+    }
+
     /// Queues a client for removal.
     fn queue_removal(&mut self, client_id: EntityId) {
-        self.clients.remove(client_id);
+        self.clients.archive_client(client_id);
     }
 
     /// Checks if the sender is valid for the given client ID and address.
@@ -210,15 +230,8 @@ impl Socket {
         sender: &ClientAddr,
         packet: &mut Packet,
     ) -> Result<()> {
-        assert!(
-            packet.sender() == INVALID_CLIENT_ID,
-            "Packet sender must be invalid."
-        );
-
         // Check if a new client connecting, otherwise give it the old ID.
-        if let Some(id) = self.clients.get_id(sender) {
-            packet.set_sender(id); // Discovered ID from cache.
-        } else if packet.label() == PacketLabel::Connect {
+        if packet.label() == PacketLabel::Connect {
             // New client connecting, assign it a new ID.
             let cache_id = if self.is_remote() {
                 // Remote connection, assign a new ID.
@@ -230,6 +243,8 @@ impl Socket {
             };
 
             packet.set_sender(cache_id);
+        } else if let Some(id) = self.clients.get_id(sender) {
+            packet.set_sender(id); // Discovered ID from cache.
         } else {
             // Client is not authenticated. Never sent connect packet.
             flee!(NetError::NotConnected(*sender, true));
@@ -359,6 +374,23 @@ impl Socket {
         self.send(Deliverable { to, packet })
     }
 
+    /// Sends an error packet to the specified raw address.
+    ///
+    /// # Errors
+    ///
+    /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
+    /// - `NetError::NotConnected` if the connection is not established.
+    /// - `NetError::SocketError` if there is a socket error.
+    fn send_err_raw(&mut self, to: &ClientAddr, error: ErrorPacket, msg: &str) -> Result<()> {
+        let mut packet = Packet::new(PacketLabel::Error, self.id);
+        let mut bytes = vec![error as u8];
+
+        bytes.extend_from_slice(msg.as_bytes());
+        packet.set_payload(bytes);
+
+        self.raw.send(to, packet)
+    }
+
     /// Sends a packet to the destination UUID. If the packet is a connect packet, it will not check for self connection.
     ///
     /// # Errors
@@ -375,7 +407,7 @@ impl Socket {
         // Update the sequence number for the packet if it's not a connect packet.
         if packet.sender() != INVALID_CLIENT_ID || packet.label() != PacketLabel::Connect {
             if let Some(seq) = self.clients.get_sequence_mut(to) {
-                *seq += 1;
+                *seq = seq.wrapping_add(1);
                 packet.set_sequence(*seq);
             } else {
                 flee!(NetError::NotConnected(ClientAddr::Local(to), true));
