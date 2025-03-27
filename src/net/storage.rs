@@ -14,6 +14,7 @@ pub(crate) enum StorageError {
     InvalidClientIdCollision, // Invalid client ID collision when creating the storage.
     AtCapacity,               // Storage is at capacity when adding a new client.
     ClientExists,             // Client already exists in the storage.
+    TimedOut,                 // Client timed out.
 }
 
 impl std::fmt::Display for StorageError {
@@ -23,6 +24,7 @@ impl std::fmt::Display for StorageError {
             StorageError::InvalidClientIdCollision => write!(f, "invalid client ID collision"),
             StorageError::AtCapacity => write!(f, "capacity reached"),
             StorageError::ClientExists => write!(f, "client already exists"),
+            StorageError::TimedOut => write!(f, "client timed out"),
         }
     }
 }
@@ -99,7 +101,11 @@ pub(crate) struct ClientStorage<T> {
     addr: SparseSet<T>,              // Maps ID to socket address.
     sequence: SparseSet<SequenceId>, // Maps ID to sequence number.
 
-    archive: Cache<T>, // Cache for archiving clients.
+    archive: Cache<T>,                    // Cache for archiving clients.
+    errors: HashMap<T, (usize, Instant)>, // Cache for error counts.
+    timeout: HashMap<T, Instant>,         // Timeout for clients.
+    timeout_ms: u128,                     // Timeout in milliseconds.
+    errors_ms: u128,                      // Timeout in milliseconds for errors.
 
     pool: Vec<usize>, // Pool of IDs to use for new clients.
 }
@@ -130,6 +136,10 @@ where
             sequence: SparseSet::new(max_clients, usize::from(invalid_key)),
 
             archive: Cache::new(max_clients, 30000, usize::from(invalid_key)),
+            errors: HashMap::new(),
+            timeout: HashMap::new(),
+            timeout_ms: 30000, // 30 seconds.
+            errors_ms: 10000,  // 10 seconds.
 
             pool: Vec::with_capacity(max_clients),
         })
@@ -164,11 +174,27 @@ where
             // Add the ID back to the pool for reuse.
             self.pool.push(client_id);
         }
+
+        if !self.timeout.is_empty() {
+            self.timeout
+                .retain(|_addr, timestamp| timestamp.elapsed().as_millis() < self.timeout_ms);
+        }
+
+        if !self.errors.is_empty() {
+            self.errors.retain(|_addr, (_count, timestamp)| {
+                timestamp.elapsed().as_millis() < self.errors_ms
+            });
+        }
     }
 
     /// Checks if a client is in the archive. Returns an internal ID for the client.
     fn in_archive(&self, addr: &T) -> Option<usize> {
         self.archive.lookup(addr)
+    }
+
+    /// Checks if a client is currently timed out.
+    pub fn in_timeout(&self, addr: &T) -> bool {
+        self.timeout.contains_key(addr)
     }
 
     /// Obtains the sequence number for a client.
@@ -179,6 +205,21 @@ where
     /// Obtains a mutable reference for the sequence number of a client.
     pub fn get_sequence_mut(&mut self, client_id: EntityId) -> Option<&mut SequenceId> {
         self.sequence.get_mut(self.map_internal(client_id))
+    }
+
+    /// Obtains the error count for a client.
+    pub fn get_errors(&mut self, addr: &T) -> Option<&usize> {
+        self.errors.get(addr).map(|(count, _)| count)
+    }
+
+    /// Adds an error to a client. Creates it if the client does not exist.
+    pub fn client_err(&mut self, addr: T) {
+        if let Some((count, timestamp)) = self.errors.get_mut(&addr) {
+            *timestamp = Instant::now();
+            *count += 1;
+        } else {
+            self.errors.insert(addr, (1, Instant::now()));
+        }
     }
 
     /// Obtains the address from a clients ID.
@@ -195,6 +236,28 @@ where
     pub fn archive_client(&mut self, client_id: EntityId) {
         if let Some(addr) = self.remove(client_id) {
             self.archive.insert(self.map_internal(client_id), addr);
+        }
+    }
+
+    /// Timeouts a client and allows its `EntityId` to be reused.
+    pub fn timeout_client(&mut self, client_id: EntityId) {
+        if let Some(addr) = self.remove(client_id) {
+            self.timeout.insert(addr, Instant::now());
+            self.pool.push(self.map_internal(client_id));
+        } else if let Some(addr) = self.archive.remove(self.map_internal(client_id)) {
+            self.timeout.insert(addr, Instant::now());
+            self.pool.push(self.map_internal(client_id));
+        }
+    }
+
+    /// Timeouts a client by its address.
+    pub fn timeout_client_addr(&mut self, addr: &T) {
+        if let Some(client_id) = self.addr_id.get(addr) {
+            self.timeout_client(self.map_external(*client_id));
+        } else if let Some(client_id) = self.archive.lookup(addr) {
+            self.timeout_client(self.map_external(client_id));
+        } else {
+            self.timeout.insert(*addr, Instant::now());
         }
     }
 
@@ -219,6 +282,10 @@ where
     /// Adds a client to the storage. Returns the Client ID assigned.
     /// Returns `Self::INVALID_CLIENT_ID` if the maximum number of clients has been reached.
     pub fn add(&mut self, addr: T) -> Result<EntityId> {
+        if self.in_timeout(&addr) {
+            return Err(StorageError::TimedOut); // Client timed out.
+        }
+
         #[cfg(not(feature = "shared_ip"))]
         if self.addr_id.contains_key(&addr) || self.archive.lookup(&addr).is_some() {
             return Err(StorageError::ClientExists); // Client already exists.

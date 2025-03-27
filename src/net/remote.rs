@@ -97,7 +97,19 @@ impl SocketHandler for RemoteSocket {
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
                 // Parse the packet and client.
-                let packet = Packet::try_from(&self.buffer[..size])?;
+                let packet = match Packet::try_from(&self.buffer[..size]) {
+                    Ok(packet) => packet,
+                    Err(NetError::InvalidPacketParse(err, expected, got)) => {
+                        // Wraps the error to provide more context.
+                        flee!(NetError::InvalidPacket(
+                            ClientAddr::Ip(sender.ip(), sender.port()),
+                            err,
+                            expected,
+                            got
+                        ))
+                    }
+                    Err(why) => flee!(why),
+                };
                 Ok(Some((ClientAddr::Ip(sender.ip(), sender.port()), packet)))
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -116,7 +128,19 @@ impl SocketHandler for RemoteSocket {
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
                 // Parse the packet and client.
-                let packet = Packet::try_from(&self.buffer[..size])?;
+                let packet = match Packet::try_from(&self.buffer[..size]) {
+                    Ok(packet) => packet,
+                    Err(NetError::InvalidPacketParse(err, expected, got)) => {
+                        // Wraps the error to provide more context.
+                        flee!(NetError::InvalidPacket(
+                            ClientAddr::Ip(sender.ip(), sender.port()),
+                            err,
+                            expected,
+                            got
+                        ))
+                    }
+                    Err(why) => flee!(why),
+                };
                 Ok(Some((ClientAddr::Ip(sender.ip(), sender.port()), packet)))
             }
             Err(why) => flee!(NetError::SocketError(why.to_string())),

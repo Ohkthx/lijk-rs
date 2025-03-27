@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::{net::SocketAddr, time::Duration};
 
-use crate::{flee, utils::Task};
+use crate::{debugln, flee, utils::Task};
 
 use super::{
     ClientAddr, ClientStorage, Deliverable, EntityId, ErrorPacket, INVALID_CLIENT_ID, LocalSocket,
@@ -189,6 +189,14 @@ impl Socket {
                 )?;
                 flee!(NetError::NothingToDo);
             }
+            Err(StorageError::TimedOut) => {
+                self.send_err_raw(
+                    &client,
+                    ErrorPacket::Blacklisted,
+                    "Your address is currently blacklisted.",
+                )?;
+                flee!(NetError::NothingToDo);
+            }
             Err(why) => flee!(NetError::StorageError(why.to_string())),
         }
     }
@@ -217,6 +225,47 @@ impl Socket {
         }
 
         false
+    }
+
+    /// Handles an invalid packet error. If there are too many errors, it will timeout the client.
+    fn handle_invalid_packet_err(&mut self, error: &NetError) -> Result<()> {
+        if !self.is_server() {
+            return Ok(());
+        }
+
+        let addr = match error {
+            NetError::InvalidPacket(addr, ..)
+            | NetError::InvalidPacketSender(addr, ..)
+            | NetError::InvalidPacketAddress(addr, ..)
+            | NetError::InvalidPacketPayload(addr, ..) => *addr,
+            _ => return Ok(()),
+        };
+
+        if self.clients.in_timeout(&addr) {
+            flee!(NetError::NothingToDo);
+        }
+
+        self.clients.client_err(addr);
+        if let Some(errors) = self.clients.get_errors(&addr) {
+            if *errors > 5 {
+                // Too many errors, disconnect the client.
+                if let Some(client_id) = self.clients.get_id(&addr) {
+                    if let Err(why) = self.disconnect_client(client_id, false) {
+                        debugln!("Failed to disconnect client with too many errors: {}", why);
+                    }
+
+                    self.clients.timeout_client(client_id);
+                } else {
+                    // Client is not connected, but has too many errors.
+                    self.clients.timeout_client_addr(&addr);
+                }
+
+                debugln!("Blacklisted client with too many errors: {}", addr);
+                flee!(NetError::NothingToDo);
+            }
+        }
+
+        Ok(())
     }
 
     /// Handles a packet that has invalid Client ID. Returns `true` if authenticated.
@@ -268,7 +317,7 @@ impl Socket {
             }
 
             // ID does not match address.
-            flee!(NetError::InvalidPacketSender(cached_id, client_id));
+            flee!(NetError::InvalidPacketSender(*sender, cached_id, client_id));
         }
 
         // Only check the cache if address lookup failed.
@@ -280,6 +329,7 @@ impl Socket {
 
             // Address does not match ID.
             flee!(NetError::InvalidPacketAddress(
+                *sender,
                 cached.to_string(),
                 sender.to_string(),
             ));
@@ -299,6 +349,10 @@ impl Socket {
     /// - `NetError::InvalidPacketAddress` if the address is invalid.
     /// - `NetError::InvalidPacketPayload` if the payload is invalid.
     fn validate(&mut self, sender: &ClientAddr, packet: &mut Packet) -> Result<()> {
+        if self.clients.in_timeout(sender) {
+            flee!(NetError::NothingToDo);
+        }
+
         let mut authed = !self.is_server();
 
         // Handles a packet with an invalid client ID.
@@ -319,6 +373,7 @@ impl Socket {
             if raw_id.len() == ID_SIZE {
                 self.id = EntityId::from_be_bytes(raw_id.try_into().map_err(|_| {
                     NetError::InvalidPacketPayload(
+                        *sender,
                         "Could not parse Client ID from payload".to_string(),
                     )
                 })?);
@@ -326,6 +381,7 @@ impl Socket {
                 self.clients.insert(packet.sender(), *sender);
             } else {
                 flee!(NetError::InvalidPacketPayload(
+                    *sender,
                     "Size of payload for Client ID was incorrect".to_string()
                 ));
             }
@@ -453,13 +509,17 @@ impl Socket {
                         return Ok(None);
                     }
 
+                    self.handle_invalid_packet_err(&why)?;
                     flee!(why);
                 }
 
                 Ok(Some(packet))
             }
             Ok(None) => Ok(None),
-            Err(why) => flee!(why),
+            Err(why) => {
+                self.handle_invalid_packet_err(&why)?;
+                flee!(why)
+            }
         }
     }
 
@@ -490,13 +550,17 @@ impl Socket {
                         return Ok(None);
                     }
 
+                    self.handle_invalid_packet_err(&why)?;
                     flee!(why);
                 }
 
                 Ok(Some(packet))
             }
             Ok(None) => Ok(None),
-            Err(why) => flee!(why),
+            Err(why) => {
+                self.handle_invalid_packet_err(&why)?;
+                flee!(why)
+            }
         }
     }
 }

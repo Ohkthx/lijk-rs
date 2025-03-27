@@ -151,7 +151,7 @@ impl TryFrom<&[u8]> for Packet {
 
     fn try_from(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_SIZE {
-            flee!(NetError::InvalidPacket(
+            flee!(NetError::InvalidPacketParse(
                 ErrorPacket::InvalidPacketSize,
                 Some(HEADER_SIZE),
                 bytes.len()
@@ -161,7 +161,7 @@ impl TryFrom<&[u8]> for Packet {
         // Parse the header.
         let version = bytes[VERSION_OFFSET];
         if version != Self::CURRENT_VERSION {
-            flee!(NetError::InvalidPacket(
+            flee!(NetError::InvalidPacketParse(
                 ErrorPacket::InvalidPacketVersion,
                 Some(usize::from(Self::CURRENT_VERSION)),
                 usize::from(version)
@@ -170,7 +170,7 @@ impl TryFrom<&[u8]> for Packet {
 
         let label = PacketLabel::from(bytes[LABEL_OFFSET]);
         if label == PacketLabel::Unknown {
-            flee!(NetError::InvalidPacket(
+            flee!(NetError::InvalidPacketParse(
                 ErrorPacket::InvalidPacketLabel,
                 None,
                 usize::from(bytes[LABEL_OFFSET])
