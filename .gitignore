@@ -1,7 +1,7 @@
 # Personal / Project Specific
 .vscode/
 target/
-notes.txt
+notes.*
 commit_message
 *.env
 

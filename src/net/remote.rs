@@ -1,9 +1,11 @@
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
 use crate::flee;
+use crate::net::error::InvalidPacketError;
 
-use super::socket::SocketHandler;
-use super::{ClientAddr, NetError, Packet, Result};
+use super::error::{NetError, Result};
+use super::traits::{NetDecoder, NetEncoder, SocketHandler};
+use super::{ClientAddr, Packet, SocketOptions};
 
 /// Remote connection that uses UDP to communicate with a remote server or client.
 pub(crate) struct RemoteSocket {
@@ -16,17 +18,12 @@ pub(crate) struct RemoteSocket {
 }
 
 impl RemoteSocket {
-    /// Default addresses for the server.
-    pub(crate) const DEFAULT_SERVER_ADDR: &'static str = "127.0.0.1:31013";
-    /// Default address for the client to bind to. This is used when the client does not have a specific address.
-    pub(crate) const DEFAULT_CLIENT_ADDR: &'static str = "0.0.0.0:0";
-
     /// Creates a new remote connection with the given address.
     pub(crate) fn new(is_server: bool) -> Result<Self> {
         let addr = if is_server {
-            Self::DEFAULT_SERVER_ADDR
+            SocketOptions::DEFAULT_SERVER_ADDR
         } else {
-            Self::DEFAULT_CLIENT_ADDR
+            SocketOptions::DEFAULT_CLIENT_ADDR
         };
 
         // Bind the socket to the address.
@@ -67,8 +64,8 @@ impl RemoteSocket {
     }
 
     /// Wraps the `send_to` method to send a packet to a specific address.
-    fn send_to<T: ToSocketAddrs>(&self, packet: &Packet, addr: &T) -> Result<()> {
-        if let Err(why) = self.socket.send_to(&Vec::from(packet), addr) {
+    fn send_to<T: ToSocketAddrs>(&self, packet: Packet, addr: &T) -> Result<()> {
+        if let Err(why) = self.socket.send_to(&packet.encode(), addr) {
             flee!(NetError::SocketError(format!(
                 "Unable to send packet: {why}",
             )));
@@ -80,11 +77,13 @@ impl RemoteSocket {
 
 impl SocketHandler for RemoteSocket {
     #[inline]
-    fn send(&mut self, dest: &ClientAddr, packet: Packet) -> Result<()> {
+    fn send(&self, dest: &ClientAddr, packet: Packet) -> Result<()> {
         if let ClientAddr::Ip(ip, port) = dest {
-            self.send_to(&packet, &SocketAddr::new(*ip, *port))
+            self.send_to(packet, &SocketAddr::new(*ip, *port))
         } else {
-            flee!(NetError::NotConnected(*dest, true));
+            flee!(NetError::SocketError(
+                "Cannot send to non-IP address".to_string()
+            ));
         }
     }
 
@@ -97,15 +96,14 @@ impl SocketHandler for RemoteSocket {
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
                 // Parse the packet and client.
-                let packet = match Packet::try_from(&self.buffer[..size]) {
+                let (packet, _) = match Packet::decode(&self.buffer[..size]) {
                     Ok(packet) => packet,
-                    Err(NetError::InvalidPacketParse(err, expected, got)) => {
+                    Err(NetError::NetCode(why)) => {
                         // Wraps the error to provide more context.
                         flee!(NetError::InvalidPacket(
                             ClientAddr::Ip(sender.ip(), sender.port()),
-                            err,
-                            expected,
-                            got
+                            InvalidPacketError::Header,
+                            why,
                         ))
                     }
                     Err(why) => flee!(why),
@@ -128,15 +126,14 @@ impl SocketHandler for RemoteSocket {
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, sender)) => {
                 // Parse the packet and client.
-                let packet = match Packet::try_from(&self.buffer[..size]) {
+                let (packet, _) = match Packet::decode(&self.buffer[..size]) {
                     Ok(packet) => packet,
-                    Err(NetError::InvalidPacketParse(err, expected, got)) => {
+                    Err(NetError::NetCode(why)) => {
                         // Wraps the error to provide more context.
                         flee!(NetError::InvalidPacket(
                             ClientAddr::Ip(sender.ip(), sender.port()),
-                            err,
-                            expected,
-                            got
+                            InvalidPacketError::Header,
+                            why,
                         ))
                     }
                     Err(why) => flee!(why),

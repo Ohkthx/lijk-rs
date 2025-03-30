@@ -1,8 +1,9 @@
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::utils::SparseSet;
 
-use super::{EntityId, SequenceId};
+use super::ClientId;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -29,83 +30,20 @@ impl std::fmt::Display for StorageError {
     }
 }
 
-/// Cache structure to store values with a timeout.
-struct Cache<T> {
-    timeout_ms: u128,              // Timeout in milliseconds for cache entries.
-    lookup: HashMap<T, usize>,     // HashMap to store the lookup for fast access.
-    data: SparseSet<(T, Instant)>, // Sparse set to store the cached data and their timestamps.
-}
-
-impl<T> Cache<T>
-where
-    T: Eq + std::hash::Hash + Clone + Copy,
-{
-    /// Initializes a new cache with a specified timeout.
-    fn new(max_size: usize, timeout_ms: u128, invalid_key: usize) -> Self {
-        Self {
-            timeout_ms,
-            lookup: HashMap::with_capacity(max_size),
-            data: SparseSet::new(max_size, invalid_key),
-        }
-    }
-
-    /// Looks up a value in the cache and returns its key if it exists.
-    fn lookup(&self, value: &T) -> Option<usize> {
-        self.lookup.get(value).copied()
-    }
-
-    /// Retrieves a value from the cache by key.
-    #[allow(dead_code)]
-    fn get(&self, key: usize) -> Option<&T> {
-        self.data.get(key).map(|(data, _)| data)
-    }
-
-    /// Inserts a value into the cache with the current timestamp.
-    fn insert(&mut self, key: usize, value: T) {
-        self.lookup.insert(value, key);
-        self.data.insert(key, (value, Instant::now()));
-    }
-
-    /// Removes a value from cache by key and returns the value if it exists.
-    fn remove(&mut self, key: usize) -> Option<T> {
-        if let Some(value) = self.data.remove(key).map(|(data, _)| data) {
-            self.lookup.remove(&value);
-            return Some(value);
-        }
-
-        None
-    }
-
-    /// Clears the cache return expired entries.
-    fn drain(&mut self) -> Vec<(usize, T)> {
-        let expired = self
-            .data
-            .drain_if(|(_, timestamp)| timestamp.elapsed().as_millis() >= self.timeout_ms)
-            .map(|(client_id, (data, _))| {
-                self.lookup.remove(&data);
-                (client_id, data)
-            })
-            .collect();
-
-        expired
-    }
-}
-
 /// Information about the clients connected to the server.
 pub(crate) struct ClientStorage<T> {
-    id_offset: EntityId,   // Offset to add to the client ID.
+    id_offset: ClientId,   // Offset to add to the client ID.
     max_clients: usize,    // Maximum number of clients.
-    invalid_key: EntityId, // Invalid key for the sparse set.
+    invalid_key: ClientId, // Invalid key for the sparse set.
 
-    addr_id: HashMap<T, usize>,      // Maps socket address to ID.
-    addr: SparseSet<T>,              // Maps ID to socket address.
-    sequence: SparseSet<SequenceId>, // Maps ID to sequence number.
+    addr_id: HashMap<T, usize>, // Maps socket address to ID.
+    addr: SparseSet<T>,         // Maps ID to socket address.
+    sequence: SparseSet<u16>,   // Maps ID to sequence number.
+    ping: SparseSet<Instant>,   // Maps ID to ping.
 
-    archive: Cache<T>,                    // Cache for archiving clients.
-    errors: HashMap<T, (usize, Instant)>, // Cache for error counts.
-    timeout: HashMap<T, Instant>,         // Timeout for clients.
-    timeout_ms: u128,                     // Timeout in milliseconds.
-    errors_ms: u128,                      // Timeout in milliseconds for errors.
+    archive: HashMap<T, (usize, Instant)>, // Cache for archiving clients.
+    errors: HashMap<T, (usize, Instant)>,  // Cache for error counts.
+    blacklist: HashMap<T, Instant>,        // Blacklist for clients.
 
     pool: Vec<usize>, // Pool of IDs to use for new clients.
 }
@@ -115,11 +53,11 @@ where
     T: Eq + std::hash::Hash + Clone + Copy,
 {
     /// Initializes the client information storage.
-    pub fn new(id_offset: EntityId, max_clients: EntityId, invalid_key: EntityId) -> Result<Self> {
-        if id_offset.checked_add(max_clients).is_none() {
+    pub fn new(id_offset: ClientId, max_clients: ClientId, invalid_key: ClientId) -> Result<Self> {
+        if id_offset.0.checked_add(max_clients.0).is_none() {
             // Ensures Client ID returned is always valid.
             return Err(StorageError::OffsetOverflow);
-        } else if invalid_key >= id_offset && invalid_key < id_offset + max_clients {
+        } else if invalid_key >= id_offset && invalid_key.0 < id_offset.0 + max_clients.0 {
             // Ensures the invalid key does not overlap with valid client IDs.
             return Err(StorageError::InvalidClientIdCollision);
         }
@@ -134,12 +72,12 @@ where
             addr_id: HashMap::with_capacity(max_clients),
             addr: SparseSet::new(max_clients, usize::from(invalid_key)),
             sequence: SparseSet::new(max_clients, usize::from(invalid_key)),
+            ping: SparseSet::new(max_clients, usize::from(invalid_key)),
 
-            archive: Cache::new(max_clients, 30000, usize::from(invalid_key)),
+            // archive: Cache::new(max_clients, usize::from(invalid_key)),
+            archive: HashMap::new(),
             errors: HashMap::new(),
-            timeout: HashMap::new(),
-            timeout_ms: 30000, // 30 seconds.
-            errors_ms: 10000,  // 10 seconds.
+            blacklist: HashMap::new(),
 
             pool: Vec::with_capacity(max_clients),
         })
@@ -147,64 +85,89 @@ where
 
     /// Invalid client ID.
     #[inline]
-    pub fn invalid_client(&self) -> EntityId {
+    pub fn invalid_client(&self) -> ClientId {
         self.invalid_key
     }
 
     /// Maps an external ID to an internal ID.
     #[inline]
-    fn map_internal(&self, id: EntityId) -> usize {
+    fn map_internal(&self, id: ClientId) -> usize {
         usize::from(id) - usize::from(self.id_offset)
     }
 
     /// Maps an internal ID to an external ID.
     #[inline]
-    fn map_external(&self, id: usize) -> EntityId {
+    fn map_external(&self, id: usize) -> ClientId {
         assert!(
             id <= usize::from(self.invalid_client()),
             "ID is out of bounds when mapping to external."
         );
 
-        EntityId::try_from(id).unwrap() + self.id_offset
+        ClientId(ClientId::try_from(id).unwrap().0 + self.id_offset.0)
     }
 
-    /// Runs maintanance on the cache to remove expired entries.
-    pub fn run_tasks(&mut self) {
-        for (client_id, _addr) in self.archive.drain() {
-            // Add the ID back to the pool for reuse.
-            self.pool.push(client_id);
-        }
+    /// Drains the archive of expired entries and returns them to the pool.
+    pub fn task_drain_archive(&mut self, drain_ms: u64) {
+        let mut expired = vec![];
+        self.archive.retain(|_, (client_id, timestamp)| {
+            // Retain only the entries that are not expired.
+            if timestamp.elapsed().as_millis() < u128::from(drain_ms) {
+                true
+            } else {
+                expired.push(*client_id);
+                false
+            }
+        });
 
-        if !self.timeout.is_empty() {
-            self.timeout
-                .retain(|_addr, timestamp| timestamp.elapsed().as_millis() < self.timeout_ms);
+        for client_id in expired {
+            self.pool.push(client_id); // Add the ID back to the pool for reuse.
         }
+    }
 
-        if !self.errors.is_empty() {
-            self.errors.retain(|_addr, (_count, timestamp)| {
-                timestamp.elapsed().as_millis() < self.errors_ms
+    /// Drains the blacklist cache of expired entries. This will remove clients that have been timed out.
+    pub fn task_drain_blacklist(&mut self, timeout_ms: u64) {
+        if !self.blacklist.is_empty() {
+            self.blacklist.retain(|_addr, timestamp| {
+                timestamp.elapsed().as_millis() < u128::from(timeout_ms)
             });
         }
     }
 
-    /// Checks if a client is in the archive. Returns an internal ID for the client.
-    fn in_archive(&self, addr: &T) -> Option<usize> {
-        self.archive.lookup(addr)
+    /// Resets the errors cache to remove expired entries.
+    pub fn task_reset_errors(&mut self, errors_ms: u64) {
+        // Drain the errors cache to remove expired entries.
+        if !self.errors.is_empty() {
+            self.errors.retain(|_addr, (_count, timestamp)| {
+                timestamp.elapsed().as_millis() < u128::from(errors_ms)
+            });
+        }
     }
 
     /// Checks if a client is currently timed out.
-    pub fn in_timeout(&self, addr: &T) -> bool {
-        self.timeout.contains_key(addr)
+    pub fn is_blacklisted(&self, addr: &T) -> bool {
+        self.blacklist.contains_key(addr)
     }
 
     /// Obtains the sequence number for a client.
-    pub fn get_sequence(&self, client_id: EntityId) -> Option<&SequenceId> {
+    pub fn get_sequence(&self, client_id: ClientId) -> Option<&u16> {
         self.sequence.get(self.map_internal(client_id))
     }
 
     /// Obtains a mutable reference for the sequence number of a client.
-    pub fn get_sequence_mut(&mut self, client_id: EntityId) -> Option<&mut SequenceId> {
+    pub fn get_sequence_mut(&mut self, client_id: ClientId) -> Option<&mut u16> {
         self.sequence.get_mut(self.map_internal(client_id))
+    }
+
+    /// Obtains the ping for a client.
+    #[allow(dead_code)]
+    pub fn get_ping(&self, client_id: ClientId) -> Option<&Instant> {
+        self.ping.get(self.map_internal(client_id))
+    }
+
+    /// Obtains a mutable reference for the ping of a client.
+    #[allow(dead_code)]
+    pub fn get_ping_mut(&mut self, client_id: ClientId) -> Option<&mut Instant> {
+        self.ping.get_mut(self.map_internal(client_id))
     }
 
     /// Obtains the error count for a client.
@@ -223,49 +186,66 @@ where
     }
 
     /// Obtains the address from a clients ID.
-    pub fn get_addr(&self, client_id: EntityId) -> Option<&T> {
+    pub fn get_addr(&self, client_id: ClientId) -> Option<&T> {
         self.addr.get(self.map_internal(client_id))
     }
 
     /// Obtains the ID from a clients address.
-    pub fn get_id(&self, addr: &T) -> Option<EntityId> {
+    pub fn get_id(&self, addr: &T) -> Option<ClientId> {
         self.addr_id.get(addr).map(|id| self.map_external(*id))
     }
 
     /// Queues a client for removal by archiving its address.
-    pub fn archive_client(&mut self, client_id: EntityId) {
+    pub fn archive_client(&mut self, client_id: ClientId) {
         if let Some(addr) = self.remove(client_id) {
-            self.archive.insert(self.map_internal(client_id), addr);
+            self.archive
+                .insert(addr, (self.map_internal(client_id), Instant::now()));
         }
     }
 
-    /// Timeouts a client and allows its `EntityId` to be reused.
-    pub fn timeout_client(&mut self, client_id: EntityId) {
+    ///  Blacklists a client and allows its `ClientId` to be reused.
+    pub fn blacklist_client(&mut self, client_id: ClientId, addr: &T) {
         if let Some(addr) = self.remove(client_id) {
-            self.timeout.insert(addr, Instant::now());
+            self.blacklist.insert(addr, Instant::now());
             self.pool.push(self.map_internal(client_id));
-        } else if let Some(addr) = self.archive.remove(self.map_internal(client_id)) {
-            self.timeout.insert(addr, Instant::now());
+        } else if self.archive.remove(addr).is_some() {
+            self.blacklist.insert(*addr, Instant::now());
             self.pool.push(self.map_internal(client_id));
         }
     }
 
-    /// Timeouts a client by its address.
-    pub fn timeout_client_addr(&mut self, addr: &T) {
+    /// Blacklists a client by its address.
+    pub fn blacklist_client_addr(&mut self, addr: &T) {
         if let Some(client_id) = self.addr_id.get(addr) {
-            self.timeout_client(self.map_external(*client_id));
-        } else if let Some(client_id) = self.archive.lookup(addr) {
-            self.timeout_client(self.map_external(client_id));
+            self.blacklist_client(self.map_external(*client_id), addr);
+        } else if let Some((client_id, _)) = self.archive.get(addr) {
+            self.blacklist_client(self.map_external(*client_id), addr);
         } else {
-            self.timeout.insert(*addr, Instant::now());
+            self.blacklist.insert(*addr, Instant::now());
         }
+    }
+
+    /// Returns a list of clients that have timed out based on the specified timeout.
+    pub fn expired_clients(&self, timeout_ms: u64) -> Vec<ClientId> {
+        let now = Instant::now();
+        self.ping
+            .iter()
+            .filter_map(|(client_id, timestamp)| {
+                if now.duration_since(*timestamp) > Duration::from_millis(timeout_ms) {
+                    Some(self.map_external(*client_id))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Removes a client.
-    fn remove(&mut self, client_id: EntityId) -> Option<T> {
+    fn remove(&mut self, client_id: ClientId) -> Option<T> {
         if let Some(addr) = self.addr.remove(self.map_internal(client_id)) {
             self.addr_id.remove(&addr);
             self.sequence.remove(self.map_internal(client_id));
+            self.ping.remove(self.map_internal(client_id));
             return Some(addr);
         }
 
@@ -273,21 +253,23 @@ where
     }
 
     /// Inserts a client into the storage.
-    pub fn insert(&mut self, client_id: EntityId, addr: T) {
+    pub fn insert(&mut self, client_id: ClientId, addr: T) {
         self.addr_id.insert(addr, self.map_internal(client_id));
         self.addr.insert(self.map_internal(client_id), addr);
         self.sequence.insert(self.map_internal(client_id), 0);
+        self.ping
+            .insert(self.map_internal(client_id), Instant::now());
     }
 
     /// Adds a client to the storage. Returns the Client ID assigned.
     /// Returns `Self::INVALID_CLIENT_ID` if the maximum number of clients has been reached.
-    pub fn add(&mut self, addr: T) -> Result<EntityId> {
-        if self.in_timeout(&addr) {
+    pub fn add(&mut self, addr: T) -> Result<ClientId> {
+        if self.is_blacklisted(&addr) {
             return Err(StorageError::TimedOut); // Client timed out.
         }
 
         #[cfg(not(feature = "shared_ip"))]
-        if self.addr_id.contains_key(&addr) || self.archive.lookup(&addr).is_some() {
+        if self.addr_id.contains_key(&addr) || self.archive.contains_key(&addr) {
             return Err(StorageError::ClientExists); // Client already exists.
         }
 
@@ -296,9 +278,8 @@ where
             return Ok(self.map_external(*id)); // Client already exists.
         }
 
-        let internal_id = if let Some(id) = self.in_archive(&addr) {
-            self.archive.remove(id); // Reuse an ID from the archive.
-            id
+        let internal_id = if let Some((id, _)) = self.archive.remove(&addr) {
+            id // Reuse an ID from the archive.
         } else if let Some(id) = self.pool.pop() {
             id // Reuse an ID form the pool.
         } else {
@@ -315,7 +296,7 @@ where
     }
 
     /// Obtains the IDs and Socket Addresses of all clients.
-    pub fn addr_iter(&self) -> impl Iterator<Item = (EntityId, &T)> + '_ {
+    pub fn addr_iter(&self) -> impl Iterator<Item = (ClientId, &T)> + '_ {
         self.addr
             .iter()
             .map(|(id, addr)| (self.map_external(*id), addr))
@@ -323,7 +304,7 @@ where
 
     /// Obtains the next ID to use for a new client.
     #[allow(dead_code)]
-    pub fn next_id(&self) -> EntityId {
+    pub fn next_id(&self) -> ClientId {
         if let Some(id) = self.pool.last() {
             self.map_external(*id)
         } else {

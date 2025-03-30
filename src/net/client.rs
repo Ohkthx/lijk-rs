@@ -1,11 +1,45 @@
 use std::net::{IpAddr, SocketAddr};
 
-use super::EntityId;
+use super::netcode_derive::{NetDecode, NetEncode};
+use super::traits::{NetDecoder, NetEncoder};
+
+/// Represents a client ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NetEncode, NetDecode, Hash, PartialOrd, Ord)]
+pub struct ClientId(pub(crate) u16);
+
+impl ClientId {
+    /// Invalid Client ID.
+    pub const INVALID: Self = ClientId(u16::MAX);
+}
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientId({})", self.0)
+    }
+}
+
+impl From<ClientId> for usize {
+    fn from(client_id: ClientId) -> Self {
+        usize::from(client_id.0)
+    }
+}
+
+impl TryFrom<usize> for ClientId {
+    type Error = usize;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if value > u16::MAX as usize {
+            Err(value)
+        } else {
+            Ok(ClientId(u16::try_from(value).unwrap()))
+        }
+    }
+}
 
 /// Represents a client address, either local or remote.
 #[derive(Debug, Clone, Copy)]
 pub enum ClientAddr {
-    Local(EntityId), // Local client ID.
+    Local(ClientId), // Local client ID.
     Ip(IpAddr, u16), // Remote client IP address and port.
 }
 
@@ -29,7 +63,7 @@ impl Eq for ClientAddr {}
 impl std::hash::Hash for ClientAddr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            ClientAddr::Local(id) => id.hash(state),
+            ClientAddr::Local(client_id) => client_id.hash(state),
             #[cfg(feature = "shared_ip")]
             ClientAddr::Ip(ip, port) => {
                 ip.hash(state);
@@ -61,8 +95,8 @@ impl From<SocketAddr> for ClientAddr {
     }
 }
 
-impl From<EntityId> for ClientAddr {
-    fn from(id: EntityId) -> Self {
-        ClientAddr::Local(id)
+impl From<ClientId> for ClientAddr {
+    fn from(client_id: ClientId) -> Self {
+        ClientAddr::Local(client_id)
     }
 }

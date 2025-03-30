@@ -6,14 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use client::Client;
 use error::{AppError, Result};
-use net::{RemoteSocket, Socket};
+use net::{Socket, SocketOptions};
 use server::Server;
 use utils::Timestep;
 
 mod client;
 mod error;
 mod net;
-mod payload;
 mod server;
 mod utils;
 
@@ -90,9 +89,12 @@ impl Display for Flags {
 fn as_solo(args: &[String]) -> Result<()> {
     let (sconn, cconn) = if args.contains(&Flags::Remote.to_string()) {
         // Initialize the remote connections.
-        let server = Socket::new_remote(None).map_err(AppError::NetError)?;
-        let server_addr = server.addr().to_string();
-        let client = Socket::new_remote(Some(server_addr)).map_err(AppError::NetError)?;
+        let server_opts = SocketOptions::default_server();
+        let server = Socket::new_remote(&server_opts).map_err(AppError::NetError)?;
+
+        let client_opts = SocketOptions::default_client().server_address(server.addr());
+        let client = Socket::new_remote(&client_opts).map_err(AppError::NetError)?;
+
         (server, client)
     } else if args.contains(&Flags::Local.to_string()) {
         // Initialize the local connections.
@@ -147,8 +149,8 @@ fn as_solo(args: &[String]) -> Result<()> {
 /// Spawns a remote client used to connect to a remote server.
 fn as_client() -> Result<()> {
     // Create a socket to connect to the server.
-    let server_addr = RemoteSocket::DEFAULT_SERVER_ADDR.to_string();
-    let socket = Socket::new_remote(Some(server_addr)).map_err(AppError::NetError)?;
+    let client_opts = SocketOptions::default_client();
+    let socket = Socket::new_remote(&client_opts).map_err(AppError::NetError)?;
 
     let mut client = Client::new(socket);
     client.wait_for_connection()?;
@@ -166,7 +168,8 @@ fn as_client() -> Result<()> {
 
 /// Spawns a server that clients can connect to.
 fn as_server() -> Result<()> {
-    let socket = Socket::new_remote(None).map_err(AppError::NetError)?;
+    let server_opts = SocketOptions::default_server();
+    let socket = Socket::new_remote(&server_opts).map_err(AppError::NetError)?;
     let mut server = Server::new(socket);
     let mut timestep = Timestep::new(SERVER_TICK_RATE);
 

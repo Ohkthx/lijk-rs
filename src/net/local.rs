@@ -2,8 +2,9 @@ use std::sync::mpsc;
 
 use crate::flee;
 
-use super::socket::SocketHandler;
-use super::{ClientAddr, NetError, Packet, Result};
+use super::error::{NetError, Result};
+use super::traits::SocketHandler;
+use super::{ClientAddr, Packet};
 
 /// Local connection that uses MPSC to communicate locally.
 pub(crate) struct LocalSocket {
@@ -20,7 +21,9 @@ impl LocalSocket {
     /// Creates the receiver for the connection.
     pub(crate) fn create_rx(&mut self) -> Result<mpsc::Receiver<Packet>> {
         if self.tx.is_some() {
-            flee!(NetError::DuplicateConnection);
+            flee!(NetError::SocketError(
+                "Cannot create receiver when sender already exists".to_string()
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<Packet>();
@@ -31,7 +34,9 @@ impl LocalSocket {
     /// Sets the receiver for the connection.
     pub(crate) fn set_rx(&mut self, rx: mpsc::Receiver<Packet>) -> Result<()> {
         if self.rx.is_some() {
-            flee!(NetError::DuplicateConnection);
+            flee!(NetError::SocketError(
+                "Cannot set receiver when one already exists".to_string()
+            ));
         }
 
         self.rx = Some(rx);
@@ -47,14 +52,16 @@ impl LocalSocket {
 
 impl SocketHandler for LocalSocket {
     #[inline]
-    fn send(&mut self, dest: &ClientAddr, packet: Packet) -> Result<()> {
+    fn send(&self, _dest: &ClientAddr, packet: Packet) -> Result<()> {
         if let Some(sender) = &self.tx {
             sender
                 .send(packet)
                 .map_err(|_| NetError::SocketError("Failed to send packet".to_string()))?;
             Ok(())
         } else {
-            flee!(NetError::NotConnected(*dest, true));
+            flee!(NetError::SocketError(
+                "Cannot send to a socket that has no sender".to_string()
+            ));
         }
     }
 
@@ -62,12 +69,14 @@ impl SocketHandler for LocalSocket {
     fn try_recv(&mut self) -> Result<Option<(ClientAddr, Packet)>> {
         if let Some(rx) = &self.rx {
             match rx.try_recv() {
-                Ok(packet) => Ok(Some((ClientAddr::Local(packet.sender()), packet))),
+                Ok(packet) => Ok(Some((ClientAddr::Local(packet.source()), packet))),
                 Err(mpsc::TryRecvError::Empty) => Ok(None),
                 Err(mpsc::TryRecvError::Disconnected) => flee!(NetError::Disconnected),
             }
         } else {
-            flee!(NetError::Disconnected);
+            flee!(NetError::SocketError(
+                "Cannot receive from a socket that has no receiver".to_string()
+            ));
         }
     }
 
@@ -75,11 +84,13 @@ impl SocketHandler for LocalSocket {
     fn recv(&mut self) -> Result<Option<(ClientAddr, Packet)>> {
         if let Some(rx) = &self.rx {
             match rx.recv() {
-                Ok(packet) => Ok(Some((ClientAddr::Local(packet.sender()), packet))),
+                Ok(packet) => Ok(Some((ClientAddr::Local(packet.source()), packet))),
                 Err(_) => flee!(NetError::Disconnected),
             }
         } else {
-            flee!(NetError::Disconnected);
+            flee!(NetError::SocketError(
+                "Cannot receive from a socket that has no receiver".to_string()
+            ));
         }
     }
 }

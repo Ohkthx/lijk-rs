@@ -1,4 +1,4 @@
-use crate::net::NetError;
+use crate::net::error::NetError;
 
 /// Result type for application actions.
 pub(crate) type Result<T> = std::result::Result<T, AppError>;

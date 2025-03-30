@@ -1,25 +1,22 @@
+use std::mem;
+use std::net::SocketAddr;
 use std::str::FromStr;
-use std::{net::SocketAddr, time::Duration};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{debugln, flee, utils::Task};
-
+use super::builtins::{ConnectionPayload, ErrorPayload, PingPayload};
+use super::error::{ErrorPacket, NetError, Result};
+use super::storage::{ClientStorage, StorageError};
+use super::task::TaskScheduler;
+use super::traits::{NetDecoder, SocketHandler};
 use super::{
-    ClientAddr, ClientStorage, Deliverable, EntityId, ErrorPacket, INVALID_CLIENT_ID, LocalSocket,
-    NetError, Packet, PacketLabel, RemoteSocket, Result, SERVER_ID, storage::StorageError,
+    ClientAddr, ClientId, Deliverable, LocalSocket, Packet, PacketLabel, RemoteSocket,
+    SocketOptions,
 };
+use crate::net::error::InvalidPacketError;
+use crate::{debugln, flee};
 
-/// Trait for handling packets.
-pub(crate) trait SocketHandler {
-    /// Send a packet to the connection.
-    #[allow(dead_code)]
-    fn send(&mut self, dest: &ClientAddr, packet: Packet) -> Result<()>;
-    /// Try to receive a packet from the connection.
-    #[allow(dead_code)]
-    fn try_recv(&mut self) -> Result<Option<(ClientAddr, Packet)>>;
-    /// Waits to receive a packet from the connection.
-    #[allow(dead_code)]
-    fn recv(&mut self) -> Result<Option<(ClientAddr, Packet)>>;
-}
+/// Default ID of the server.
+const SERVER_CLIENT_ID: ClientId = ClientId(0);
 
 /// Socket type for the connection. Either a remote or local connection.
 enum SocketType {
@@ -29,7 +26,7 @@ enum SocketType {
 
 impl SocketHandler for SocketType {
     #[inline]
-    fn send(&mut self, dest: &ClientAddr, packet: Packet) -> Result<()> {
+    fn send(&self, dest: &ClientAddr, packet: Packet) -> Result<()> {
         match self {
             SocketType::Remote(socket) => socket.send(dest, packet),
             SocketType::Local(socket) => socket.send(dest, packet),
@@ -56,39 +53,100 @@ impl SocketHandler for SocketType {
 /// Socket for the connection. Used to send and receive packets to a client / server.
 /// This is a unified interface for both local and remote connections.
 pub struct Socket {
-    id: EntityId,                       // Unique identifier for the connection.
+    id: ClientId,                    // Unique identifier for the connection.
     server_addr: Option<ClientAddr>, // The server address for the connection. Only set for clients.
     raw: SocketType,                 // Lower level socket type for the connection.
+
     clients: ClientStorage<ClientAddr>, // Storage for the clients connected to the socket.
-    task_runner: Task,               // Task runner for managing tasks.
+    scheduler: TaskScheduler,           // Task scheduler for managing tasks.
 }
 
 impl Socket {
-    /// Maximum amount of clients for the socket.
-    pub const MAX_CLIENTS: EntityId = 256;
-
     /// Creates a new socket with the given socket type.
-    fn new(socket: SocketType, server_addr: Option<ClientAddr>) -> Result<Self> {
-        let is_server = server_addr.is_none();
-        let offset = EntityId::from(is_server);
-        let id = if is_server {
-            SERVER_ID
+    fn new(socket: SocketType, opts: &SocketOptions, addr: Option<ClientAddr>) -> Result<Self> {
+        let offset = ClientId(u16::from(opts.is_server()));
+        let id = if opts.is_server() {
+            SERVER_CLIENT_ID
         } else {
-            INVALID_CLIENT_ID
+            ClientId::INVALID
         };
 
-        let clients = match ClientStorage::new(offset, Self::MAX_CLIENTS, INVALID_CLIENT_ID) {
-            Ok(clients) => clients,
-            Err(why) => flee!(NetError::StorageError(why.to_string())),
-        };
+        let clients =
+            match ClientStorage::new(offset, ClientId(opts.max_clients), ClientId::INVALID) {
+                Ok(clients) => clients,
+                Err(why) => flee!(NetError::StorageError(why.to_string())),
+            };
 
-        Ok(Self {
+        let mut socket = Self {
             id,
-            server_addr,
+            server_addr: addr,
             raw: socket,
+
             clients,
-            task_runner: Task::start(Duration::from_millis(1000), 0),
-        })
+            scheduler: TaskScheduler::new(opts.task_interval_ms),
+        };
+
+        if let Some(interval) = opts.archive_interval_ms {
+            // Set the archive interval for clearing archived clients.
+            socket.register_task("archive", interval, move |sock| {
+                sock.clients.task_drain_archive(interval);
+                Ok(())
+            });
+        }
+
+        if let Some(interval) = opts.blacklist_interval_ms {
+            // Set the blacklist interval for clearing blacklisted clients.
+            socket.register_task("blacklist", interval, move |sock| {
+                sock.clients.task_drain_blacklist(interval);
+                Ok(())
+            });
+        }
+
+        if let Some(interval) = opts.error_reset_interval_ms {
+            // Set the error interval for clearing error counts.
+            socket.register_task("error reset", interval, move |sock| {
+                sock.clients.task_reset_errors(interval);
+                Ok(())
+            });
+        }
+
+        if let Some(interval) = opts.disconnect_interval_ms {
+            // Register the disconnect task for expired clients.
+            socket.register_task("expired", interval, move |sock| {
+                for client_id in sock.expired_clients(interval) {
+                    debugln!(
+                        "[SERVER] Disconnecting client [{}] due to timeout.",
+                        client_id
+                    );
+
+                    if sock.is_server() {
+                        sock.disconnect_client(client_id, true)?;
+                    } else {
+                        flee!(NetError::Disconnected);
+                    }
+                }
+
+                Ok(())
+            });
+        }
+
+        if !socket.is_server() {
+            if let Some(interval) = opts.ping_interval_ms {
+                // Register the ping task.
+                socket.register_task("ping", interval, |sock| {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                    let mut packet = Packet::new(PacketLabel::Ping, sock.id());
+                    packet.set_payload(PingPayload(now, true));
+
+                    sock.send(Deliverable {
+                        to: ClientId(0),
+                        packet,
+                    })
+                });
+            }
+        }
+
+        Ok(socket)
     }
 
     /// Creates a new local connection pair.
@@ -107,24 +165,32 @@ impl Socket {
         let server = SocketType::Local(server_socket);
         let client = SocketType::Local(client_socket);
 
-        let server_addr = Some(ClientAddr::Local(SERVER_ID));
-        Ok((Self::new(server, None)?, Self::new(client, server_addr)?))
+        let server_opts = SocketOptions::default_server();
+        let client_opts = SocketOptions::default_client();
+
+        let server_addr = Some(ClientAddr::Local(SERVER_CLIENT_ID));
+        Ok((
+            Self::new(server, &server_opts, None)?,
+            Self::new(client, &client_opts, server_addr)?,
+        ))
     }
 
     /// Creates a new remote connection with the given address.
-    pub fn new_remote(server_addr: Option<String>) -> Result<Self> {
-        // Conver the server address from String to Client.
-        let addr = if let Some(address) = server_addr {
-            match SocketAddr::from_str(&address) {
+    pub fn new_remote(opts: &SocketOptions) -> Result<Self> {
+        // Convert the server address from String to Client.
+        let addr = if let Some(address) = &opts.server_address {
+            match SocketAddr::from_str(address) {
                 Ok(addr) => Some(ClientAddr::Ip(addr.ip(), addr.port())),
-                Err(_) => flee!(NetError::InvalidServerAddress(address)),
+                Err(_) => flee!(NetError::SocketError(format!(
+                    "Failed to parse server address: '{address}'. Please use a valid IP:PORT format.",
+                ))),
             }
         } else {
             None
         };
 
         let socket = RemoteSocket::new(addr.is_none())?;
-        Self::new(SocketType::Remote(Box::new(socket)), addr)
+        Self::new(SocketType::Remote(Box::new(socket)), opts, addr)
     }
 
     /// Checks if the socket is a local connection.
@@ -159,105 +225,102 @@ impl Socket {
 
     /// Local ID of the socket.
     #[inline]
-    pub fn id(&self) -> EntityId {
+    pub fn id(&self) -> ClientId {
         self.id
     }
 
+    /// Returns clients that have not been active for a specified amount of time (in milliseconds).
+    pub fn expired_clients(&self, timeout_ms: u64) -> Vec<ClientId> {
+        self.clients.expired_clients(timeout_ms)
+    }
+
     /// Obtains the UUIDs of the remote sockets.
+    #[allow(dead_code)]
     #[inline]
-    pub fn remote_ids(&self) -> Vec<EntityId> {
+    pub fn remote_ids(&self) -> Vec<ClientId> {
         self.clients.addr_iter().map(|(id, _)| id).collect()
     }
 
     /// Obtains the last sequence ID for the connection.
     #[allow(dead_code)]
     #[inline]
-    pub fn last_sequence_id(&self, client_id: EntityId) -> Option<&EntityId> {
+    pub fn last_sequence_id(&self, client_id: ClientId) -> Option<&u16> {
         self.clients.get_sequence(client_id)
     }
 
-    /// Adds a new client, returning the client's ID.
-    fn add_client(&mut self, client: ClientAddr) -> Result<EntityId> {
-        match self.clients.add(client) {
-            Ok(client_id) => Ok(client_id),
-            Err(StorageError::AtCapacity) => flee!(NetError::TooManyConnections),
-            Err(StorageError::ClientExists) => {
-                self.send_err_raw(
-                    &client,
-                    ErrorPacket::TooManyConnections,
-                    "Only one connection per IP allowed.",
-                )?;
-                flee!(NetError::NothingToDo);
-            }
-            Err(StorageError::TimedOut) => {
-                self.send_err_raw(
-                    &client,
-                    ErrorPacket::Blacklisted,
-                    "Your address is currently blacklisted.",
-                )?;
-                flee!(NetError::NothingToDo);
-            }
-            Err(why) => flee!(NetError::StorageError(why.to_string())),
-        }
+    /// Adds a new task to the scheduler.
+    pub fn register_task<F, N: Into<String>>(&mut self, name: N, frequency_ms: u64, callback: F)
+    where
+        F: Fn(&mut Socket) -> Result<()> + Send + Sync + 'static,
+    {
+        self.scheduler.register(name, frequency_ms, callback);
     }
 
-    /// Checks for any tasks that need to be run for the clients.
-    pub(crate) fn run_tasks(&mut self) {
-        if !self.task_runner.is_ready() {
-            return;
+    /// Runs the tasks in the scheduler.
+    pub fn run_tasks(&mut self, force: bool) -> Result<()> {
+        if force || self.scheduler.is_ready() {
+            let mut scheduler = mem::take(&mut self.scheduler);
+            scheduler.run(self)?; // Run the tasks.
+            self.scheduler = scheduler; // Move it back into `self`.
         }
+        Ok(())
+    }
 
-        self.clients.run_tasks();
-        self.task_runner.reset();
+    /// Adds a new client, returning the client's ID.
+    fn add_client(&mut self, client: ClientAddr) -> Result<ClientId> {
+        let (err, msg) = match self.clients.add(client) {
+            Err(StorageError::AtCapacity) => (
+                ErrorPacket::TooManyConnections,
+                "Server is at maximum capacity for clients. Please try again later.",
+            ),
+            Err(StorageError::ClientExists) => (
+                ErrorPacket::TooManyConnections,
+                "Only one connection per IP allowed. Please try again later.",
+            ),
+            Err(StorageError::TimedOut) => (
+                ErrorPacket::Blacklisted,
+                "Your address is currently blacklisted. Please try again later.",
+            ),
+            Err(why) => flee!(NetError::StorageError(why.to_string())),
+            Ok(client_id) => return Ok(client_id),
+        };
+
+        self.send_err(&client, err, msg)?;
+        flee!(NetError::NothingToDo);
     }
 
     /// Queues a client for removal.
-    fn queue_removal(&mut self, client_id: EntityId) {
+    fn queue_removal(&mut self, client_id: ClientId) {
         self.clients.archive_client(client_id);
-    }
-
-    /// Checks if the sender is valid for the given client ID and address.
-    fn valid_sender(&self, client_id: EntityId, addr: &ClientAddr) -> bool {
-        if let Some(cached_id) = self.clients.get_id(addr) {
-            return client_id == cached_id;
-        } else if let Some(cached) = self.clients.get_addr(client_id) {
-            return addr == cached;
-        }
-
-        false
     }
 
     /// Handles an invalid packet error. If there are too many errors, it will timeout the client.
     fn handle_invalid_packet_err(&mut self, error: &NetError) -> Result<()> {
-        if !self.is_server() {
+        // Extract the address for invalid packets.
+        let NetError::InvalidPacket(addr, ..) = error else {
             return Ok(());
-        }
-
-        let addr = match error {
-            NetError::InvalidPacket(addr, ..)
-            | NetError::InvalidPacketSender(addr, ..)
-            | NetError::InvalidPacketAddress(addr, ..)
-            | NetError::InvalidPacketPayload(addr, ..) => *addr,
-            _ => return Ok(()),
         };
 
-        if self.clients.in_timeout(&addr) {
+        // Handle the case where the socket is not in server mode or address in timeout.
+        if !self.is_server() {
+            return Ok(());
+        } else if self.clients.is_blacklisted(addr) {
             flee!(NetError::NothingToDo);
         }
 
-        self.clients.client_err(addr);
-        if let Some(errors) = self.clients.get_errors(&addr) {
+        self.clients.client_err(*addr);
+        if let Some(errors) = self.clients.get_errors(addr) {
             if *errors > 5 {
                 // Too many errors, disconnect the client.
-                if let Some(client_id) = self.clients.get_id(&addr) {
+                if let Some(client_id) = self.clients.get_id(addr) {
                     if let Err(why) = self.disconnect_client(client_id, false) {
                         debugln!("Failed to disconnect client with too many errors: {}", why);
                     }
 
-                    self.clients.timeout_client(client_id);
+                    self.clients.blacklist_client_addr(addr);
                 } else {
                     // Client is not connected, but has too many errors.
-                    self.clients.timeout_client_addr(&addr);
+                    self.clients.blacklist_client_addr(addr);
                 }
 
                 debugln!("Blacklisted client with too many errors: {}", addr);
@@ -274,11 +337,7 @@ impl Socket {
     ///
     /// - `NetError::NotConnected` if the connection is not established.
     /// - `NetError::TooManyConnections` if the maximum number of clients has been reached.
-    fn handle_invalid_client_packet(
-        &mut self,
-        sender: &ClientAddr,
-        packet: &mut Packet,
-    ) -> Result<()> {
+    fn validate_invalid_client(&mut self, sender: &ClientAddr, packet: &mut Packet) -> Result<()> {
         // Check if a new client connecting, otherwise give it the old ID.
         if packet.label() == PacketLabel::Connect {
             // New client connecting, assign it a new ID.
@@ -291,12 +350,12 @@ impl Socket {
                 self.add_client(ClientAddr::Local(id))?
             };
 
-            packet.set_sender(cache_id);
+            packet.set_source(cache_id);
         } else if let Some(id) = self.clients.get_id(sender) {
-            packet.set_sender(id); // Discovered ID from cache.
+            packet.set_source(id); // Discovered ID from cache.
         } else {
             // Client is not authenticated. Never sent connect packet.
-            flee!(NetError::NotConnected(*sender, true));
+            flee!(NetError::NotConnected(*sender));
         }
 
         Ok(())
@@ -309,7 +368,7 @@ impl Socket {
     /// - `NetError::InvalidPacketSender` if the sender ID is invalid.
     /// - `NetError::InvalidPacketAddress` if the address is invalid.
     /// - `NetError::NotConnected` if the connection is not established.
-    fn handle_client_lookup(&mut self, sender: &ClientAddr, client_id: EntityId) -> Result<()> {
+    fn validate_client_lookup(&mut self, sender: &ClientAddr, client_id: ClientId) -> Result<()> {
         if let Some(cached_id) = self.clients.get_id(sender) {
             // Check that the client is using the correct ID.
             if client_id == cached_id {
@@ -317,7 +376,13 @@ impl Socket {
             }
 
             // ID does not match address.
-            flee!(NetError::InvalidPacketSender(*sender, cached_id, client_id));
+            flee!(NetError::InvalidPacket(
+                *sender,
+                InvalidPacketError::Source,
+                format!(
+                    "Client ID mismatch: expected {cached_id} but got {client_id} from address {sender}",
+                )
+            ));
         }
 
         // Only check the cache if address lookup failed.
@@ -328,15 +393,17 @@ impl Socket {
             }
 
             // Address does not match ID.
-            flee!(NetError::InvalidPacketAddress(
+            flee!(NetError::InvalidPacket(
                 *sender,
-                cached.to_string(),
-                sender.to_string(),
+                InvalidPacketError::Source,
+                format!(
+                    "Client address mismatch: expected {cached} but got {sender} for ID {client_id}",
+                )
             ));
         }
 
         // Socket Address and ID are not in the cache.
-        flee!(NetError::NotConnected(*sender, true));
+        flee!(NetError::NotConnected(*sender));
     }
 
     /// Validates the incoming packet is correct.
@@ -349,42 +416,144 @@ impl Socket {
     /// - `NetError::InvalidPacketAddress` if the address is invalid.
     /// - `NetError::InvalidPacketPayload` if the payload is invalid.
     fn validate(&mut self, sender: &ClientAddr, packet: &mut Packet) -> Result<()> {
-        if self.clients.in_timeout(sender) {
+        if self.clients.is_blacklisted(sender) {
             flee!(NetError::NothingToDo);
         }
 
         let mut authed = !self.is_server();
 
         // Handles a packet with an invalid client ID.
-        if packet.sender() == INVALID_CLIENT_ID {
-            self.handle_invalid_client_packet(sender, packet)?;
+        if packet.source() == ClientId::INVALID {
+            self.validate_invalid_client(sender, packet)?;
             authed = true; // Would have error out if not authenticated.
         }
 
         // Check if the sender is in the cache.
         if self.is_server() && !authed {
-            self.handle_client_lookup(sender, packet.sender())?;
+            self.validate_client_lookup(sender, packet.source())?;
         }
 
-        // Assign the ID to the client when connecting.
-        if packet.label() == PacketLabel::Connect && !self.is_server() {
-            const ID_SIZE: usize = size_of::<EntityId>();
-            let raw_id = packet.payload();
-            if raw_id.len() == ID_SIZE {
-                self.id = EntityId::from_be_bytes(raw_id.try_into().map_err(|_| {
-                    NetError::InvalidPacketPayload(
-                        *sender,
-                        "Could not parse Client ID from payload".to_string(),
-                    )
-                })?);
+        Ok(())
+    }
 
-                self.clients.insert(packet.sender(), *sender);
-            } else {
-                flee!(NetError::InvalidPacketPayload(
-                    *sender,
-                    "Size of payload for Client ID was incorrect".to_string()
+    /// Processes the connection packet for the socket. This handles both server and client modes.
+    fn packet_action_connection(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
+        let Ok((conn, _)) = ConnectionPayload::decode(packet.payload()) else {
+            // Failed to decode connection payload, return an error.
+            flee!(NetError::InvalidPacket(
+                *addr,
+                InvalidPacketError::Payload,
+                "Could not parse connection payload".to_string()
+            ));
+        };
+
+        if conn.0 != Packet::CURRENT_VERSION {
+            flee!(NetError::InvalidPacket(
+                *addr,
+                InvalidPacketError::Version,
+                format!(
+                    "packet version mismatch {} != {}",
+                    conn.0,
+                    Packet::CURRENT_VERSION
+                ),
+            ));
+        }
+
+        if self.is_server() {
+            // Server mode: Send connection payload to the client.
+            let payload = ConnectionPayload(Packet::CURRENT_VERSION, packet.source(), 5000);
+            let mut response = Packet::new(PacketLabel::Connect, self.id());
+            response.set_payload(payload);
+            self.send(Deliverable::new(packet.source(), response))?;
+        } else {
+            // Client mode: Accept the connection and set the ID.
+            self.id = conn.1;
+            self.clients.insert(packet.source(), *addr);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    /// Processes a disconnection packet. This handles the removal of a client from the socket's storage.
+    fn packet_action_disconnection(&mut self, packet: &Packet, _addr: &ClientAddr) -> Result<()> {
+        // Remove the client from the storage.
+        self.queue_removal(packet.source());
+        Ok(())
+    }
+
+    /// Processes a ping packet. This handles both ping and pong packets.
+    fn packet_action_ping(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
+        let Ok((ping, _)) = PingPayload::decode(packet.payload()) else {
+            // Failed to decode ping payload, return an error.
+            flee!(NetError::InvalidPacket(
+                *addr,
+                InvalidPacketError::Payload,
+                "Could not parse ping payload".to_string()
+            ));
+        };
+
+        if let Some(last) = self.clients.get_ping_mut(packet.source()) {
+            *last = Instant::now();
+        }
+
+        if ping.1 {
+            // Ping packet, send a pong packet back.
+            let mut response = Packet::new(PacketLabel::Ping, self.id());
+            response.set_payload(PingPayload(ping.0, false));
+            self.send(Deliverable::new(packet.source(), response))?;
+        }
+        Ok(())
+    }
+
+    /// Processes the packet actions for errors. This handles the error packets and invokes the appropriate error handling.
+    fn packet_actions_errors(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
+        if self.is_server() {
+            return Ok(());
+        }
+
+        let Ok((payload, _)) = ErrorPayload::decode(packet.payload()) else {
+            // Failed to decode error payload, return an error.
+            // This means the payload was not a valid error packet.
+            flee!(NetError::InvalidPacket(
+                *addr,
+                InvalidPacketError::Payload,
+                "Could not parse error payload".to_string()
+            ));
+        };
+
+        match payload.0 {
+            ErrorPacket::TooManyConnections => {
+                flee!(NetError::SocketError(
+                    "Received 'TooManyConnections' error from server.".to_string()
                 ));
             }
+            ErrorPacket::Blacklisted => {
+                flee!(NetError::SocketError(
+                    "Received 'Blacklisted' error from server. You are temporarily blocked."
+                        .to_string()
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Handles the packet actions based on the packet type.
+    fn packet_actions(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
+        let result = match packet.label() {
+            PacketLabel::Connect => self.packet_action_connection(packet, addr),
+            PacketLabel::Disconnect => self.packet_action_disconnection(packet, addr),
+            PacketLabel::Ping => self.packet_action_ping(packet, addr),
+            PacketLabel::Error => self.packet_actions_errors(packet, addr),
+            _ => Ok(()),
+        };
+
+        // Handles the packet-related errors from the packet actions.
+        if let Some(err) = result.err() {
+            self.handle_invalid_packet_err(&err)?;
+            flee!(err);
         }
 
         Ok(())
@@ -398,9 +567,9 @@ impl Socket {
     /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
     /// - `NetError::NotConnected` if the connection is not established.
     /// - `NetError::SocketError` if there is a socket error.
-    pub fn disconnect_client(&mut self, client_id: EntityId, notify: bool) -> Result<()> {
+    pub fn disconnect_client(&mut self, client_id: ClientId, notify: bool) -> Result<()> {
         if !self.is_server() {
-            flee!(NetError::NotServer);
+            flee!(NetError::NothingToDo);
         }
 
         if notify {
@@ -420,29 +589,20 @@ impl Socket {
     /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
     /// - `NetError::NotConnected` if the connection is not established.
     /// - `NetError::SocketError` if there is a socket error.
-    fn send_err(&mut self, to: EntityId, error: ErrorPacket, msg: &str) -> Result<()> {
+    fn send_err(&mut self, to: &ClientAddr, error: ErrorPacket, msg: &str) -> Result<()> {
         let mut packet = Packet::new(PacketLabel::Error, self.id);
         let mut bytes = vec![error as u8];
 
         bytes.extend_from_slice(msg.as_bytes());
         packet.set_payload(bytes);
 
-        self.send(Deliverable { to, packet })
-    }
-
-    /// Sends an error packet to the specified raw address.
-    ///
-    /// # Errors
-    ///
-    /// - `NetError::SelfConnection` if the destination is the same as the source and the packet is not a connect packet.
-    /// - `NetError::NotConnected` if the connection is not established.
-    /// - `NetError::SocketError` if there is a socket error.
-    fn send_err_raw(&mut self, to: &ClientAddr, error: ErrorPacket, msg: &str) -> Result<()> {
-        let mut packet = Packet::new(PacketLabel::Error, self.id);
-        let mut bytes = vec![error as u8];
-
-        bytes.extend_from_slice(msg.as_bytes());
-        packet.set_payload(bytes);
+        // Attempt to set the Sequence ID.
+        if let Some(client_id) = self.clients.get_id(to) {
+            if let Some(seq) = self.clients.get_sequence_mut(client_id) {
+                *seq = seq.wrapping_add(1);
+                packet.set_sequence(*seq);
+            }
+        }
 
         self.raw.send(to, packet)
     }
@@ -457,16 +617,22 @@ impl Socket {
     #[allow(dead_code)]
     pub fn send(&mut self, Deliverable { to, mut packet }: Deliverable) -> Result<()> {
         if self.id() == to && packet.label() != PacketLabel::Connect {
-            flee!(NetError::SelfConnection);
+            debugln!(
+                "Self connection detected: source ID {} and destination ID {}. Packet: {:?}.",
+                self.id(),
+                to,
+                packet
+            );
+            flee!(NetError::NothingToDo);
         }
 
         // Update the sequence number for the packet if it's not a connect packet.
-        if packet.sender() != INVALID_CLIENT_ID || packet.label() != PacketLabel::Connect {
+        if packet.source() != ClientId::INVALID || packet.label() != PacketLabel::Connect {
             if let Some(seq) = self.clients.get_sequence_mut(to) {
                 *seq = seq.wrapping_add(1);
                 packet.set_sequence(*seq);
             } else {
-                flee!(NetError::NotConnected(ClientAddr::Local(to), true));
+                flee!(NetError::NotConnected(ClientAddr::Local(to)));
             }
         }
 
@@ -476,9 +642,9 @@ impl Socket {
         } else if let Some(client) = self.server_addr() {
             self.raw.send(&client, packet)
         } else if !self.is_remote() {
-            self.raw.send(&ClientAddr::Local(SERVER_ID), packet)
+            self.raw.send(&ClientAddr::Local(SERVER_CLIENT_ID), packet)
         } else {
-            flee!(NetError::NotConnected(ClientAddr::Local(to), true));
+            flee!(NetError::NotConnected(ClientAddr::Local(to)));
         }
     }
 
@@ -498,21 +664,11 @@ impl Socket {
         match self.raw.try_recv() {
             Ok(Some((client, mut packet))) => {
                 if let Err(why) = self.validate(&client, &mut packet) {
-                    if why == NetError::TooManyConnections
-                        && self.valid_sender(packet.sender(), &client)
-                    {
-                        self.send_err(
-                            packet.sender(),
-                            ErrorPacket::TooManyConnections,
-                            "Too many connections",
-                        )?;
-                        return Ok(None);
-                    }
-
                     self.handle_invalid_packet_err(&why)?;
                     flee!(why);
                 }
 
+                self.packet_actions(&packet, &client)?;
                 Ok(Some(packet))
             }
             Ok(None) => Ok(None),
@@ -539,21 +695,11 @@ impl Socket {
         match self.raw.recv() {
             Ok(Some((client, mut packet))) => {
                 if let Err(why) = self.validate(&client, &mut packet) {
-                    if why == NetError::TooManyConnections
-                        && self.valid_sender(packet.sender(), &client)
-                    {
-                        self.send_err(
-                            packet.sender(),
-                            ErrorPacket::TooManyConnections,
-                            "Too many connections",
-                        )?;
-                        return Ok(None);
-                    }
-
                     self.handle_invalid_packet_err(&why)?;
                     flee!(why);
                 }
 
+                self.packet_actions(&packet, &client)?;
                 Ok(Some(packet))
             }
             Ok(None) => Ok(None),

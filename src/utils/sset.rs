@@ -116,6 +116,7 @@ impl<T> SparseSet<T> {
     }
 
     /// Allows for iteration over the dense set.
+    #[allow(dead_code)]
     pub fn iter(&self) -> SparseSetIterator<T> {
         SparseSetIterator {
             sset: self,
@@ -124,6 +125,7 @@ impl<T> SparseSet<T> {
     }
 
     /// Removes all values that match the predicate `f`.
+    #[allow(dead_code)]
     pub fn drain_if<F>(&mut self, mut f: F) -> impl Iterator<Item = (usize, T)>
     where
         F: FnMut(&T) -> bool,
@@ -164,7 +166,7 @@ impl<'a, T> Iterator for SparseSetIterator<'a, T> {
     type Item = (&'a usize, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if (self.index) < self.sset.dense.len() {
+        if self.index < self.sset.dense.len() {
             let entry = &self.sset.dense[self.index];
             self.index += 1;
             Some((&entry.key, &entry.value))
