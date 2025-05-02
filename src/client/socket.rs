@@ -1,19 +1,20 @@
 use std::time::Duration;
 
 use crate::error::AppError;
-use crate::net::builtins::{ConnectionPayload, ErrorPayload, MessagePayload, PingPayload};
+use crate::net::builtins::{ConnectionPayload, ErrorPayload, MessagePayload};
 use crate::net::error::NetError;
-use crate::net::traits::{NetDecoder, NetEncoder};
+use crate::net::traits::NetEncoder;
 use crate::net::{ClientId, Deliverable, Packet, PacketLabel, Socket};
+use crate::utils::decode;
 use crate::{Result, debugln, flee};
 
 /// Basic client implementation that connects to a server.
-pub struct Client {
+pub struct ClientSocket {
     socket: Socket,   // The socket used for communication.
     server: ClientId, // The ID of the server to connect to.
 }
 
-impl Client {
+impl ClientSocket {
     /// Maximum number of connection retries before disconnecting.
     const MAX_CONNECTION_RETRY: u8 = 30;
 
@@ -27,19 +28,16 @@ impl Client {
 
     /// Obtains the ID of the client.
     #[inline]
-    fn id(&self) -> ClientId {
+    pub fn id(&self) -> ClientId {
         self.socket.id()
     }
 
-    /// Decpodes a packet payload into the specified type.
-    pub fn decode<T: NetDecoder>(packet: &Packet) -> Result<T> {
-        T::decode(packet.payload())
-            .map(|(payload, _)| payload)
-            .map_err(AppError::NetError)
-    }
-
     /// Sends a packet to the server.
-    fn send(&mut self, packet_type: PacketLabel, payload: Option<impl NetEncoder>) -> Result<()> {
+    pub fn send(
+        &mut self,
+        packet_type: PacketLabel,
+        payload: Option<impl NetEncoder>,
+    ) -> Result<()> {
         let mut packet = Packet::new(packet_type, self.id());
         if let Some(data) = payload {
             packet.set_payload(data);
@@ -47,7 +45,7 @@ impl Client {
 
         match self.socket.send(Deliverable::new(self.server, packet)) {
             Ok(()) => Ok(()),
-            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why))),
+            Err(NetError::SocketError(why)) => Err(AppError::Net(NetError::SocketError(why))),
             Err(why) => {
                 debugln!("CLIENT: Failed to send packet to server: {}", why);
                 Ok(())
@@ -64,18 +62,18 @@ impl Client {
             self.send(PacketLabel::Connect, Some(payload))?;
             std::thread::sleep(Duration::from_millis(500));
 
-            self.packet_processor()?;
+            self.packet_processor(&mut vec![])?;
             retry_count += 1;
         }
 
         // Check if a connection was never established.
         if retry_count >= Self::MAX_CONNECTION_RETRY {
-            flee!(AppError::NetError(NetError::SocketError(format!(
+            flee!(AppError::Net(NetError::SocketError(format!(
                 "Failed to establish connection to server after {} attempts",
                 Self::MAX_CONNECTION_RETRY
             ))));
         } else if self.server == ClientId::INVALID {
-            flee!(AppError::NetError(NetError::SocketError(
+            flee!(AppError::Net(NetError::SocketError(
                 "Failed to establish connection to server, no response received.".to_string()
             )));
         }
@@ -84,19 +82,23 @@ impl Client {
     }
 
     /// Runs a single step of the client, processing packets and handling timeouts.
-    pub fn run_step(&mut self) -> Result<()> {
-        while self.packet_processor()?.is_some() {}
-        self.socket.run_tasks(false).map_err(AppError::NetError)?;
+    pub fn run_step(&mut self) -> Result<Vec<Packet>> {
+        let mut out = vec![];
+        while self.packet_processor(&mut out)?.is_some() {}
+        self.socket.run_tasks(false).map_err(AppError::Net)?;
 
-        Ok(())
+        Ok(out)
     }
 
     /// Processes incoming packets and handles different packet types.
-    fn packet_processor(&mut self) -> Result<Option<Packet>> {
+    fn packet_processor(
+        &mut self,
+        out: &mut Vec<Packet>,
+    ) -> std::result::Result<Option<()>, AppError> {
         let packet = match self.socket.try_recv() {
             Ok(Some(packet)) => packet,
             Ok(None) => return Ok(None),
-            Err(NetError::SocketError(why)) => Err(AppError::NetError(NetError::SocketError(why)))?,
+            Err(NetError::SocketError(why)) => Err(AppError::Net(NetError::SocketError(why)))?,
             Err(why) => {
                 debugln!("CLIENT: Obtaining packet error: {}", why);
                 return Ok(None);
@@ -105,7 +107,7 @@ impl Client {
 
         match packet.label() {
             PacketLabel::Error => {
-                let payload = Client::decode::<ErrorPayload>(&packet)?;
+                let payload = decode::<ErrorPayload>(&packet)?;
                 debugln!(
                     "CLIENT: [{}] Received error: {:?}",
                     packet.source(),
@@ -118,7 +120,7 @@ impl Client {
             }
 
             PacketLabel::Connect => {
-                let payload = Client::decode::<ConnectionPayload>(&packet)?;
+                let payload = decode::<ConnectionPayload>(&packet)?;
                 self.server = packet.source();
                 debugln!(
                     "CLIENT: [{}] Connected, Server: {}. Payload: {:?}",
@@ -136,28 +138,23 @@ impl Client {
                     self.send(PacketLabel::Disconnect, None::<()>)?;
                 }
 
-                flee!(AppError::NetError(NetError::Disconnected));
+                flee!(AppError::Net(NetError::Disconnected));
             }
 
             PacketLabel::Ping => {
-                let payload = Client::decode::<PingPayload>(&packet)?;
-                debugln!("CLIENT: [{}] Received ping {:?}", packet.source(), payload);
+                // let payload = packet.payload::<PingPayload>()?;
+                // debugln!("CLIENT: [{}] Received ping {:?}", packet.source(), payload);
             }
 
             PacketLabel::Message => {
-                let payload = Client::decode::<MessagePayload>(&packet)?;
+                let payload = decode::<MessagePayload>(&packet)?;
                 debugln!("CLIENT: [{}] Received message: {:?}", self.id(), payload);
             }
 
-            PacketLabel::Unknown => {
-                debugln!(
-                    "CLIENT: [{}] Received unknown packet label: {:?}.",
-                    self.id(),
-                    packet.label()
-                );
-            }
+            PacketLabel::Extension(_value) => {}
         }
 
-        Ok(Some(packet))
+        out.push(packet);
+        Ok(Some(()))
     }
 }

@@ -92,6 +92,12 @@ impl NetDecoder for Vec<u8> {
     }
 }
 
+impl NetEncoder for &[u8] {
+    fn encode(self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+
 impl NetEncoder for String {
     fn encode(self) -> Vec<u8> {
         self.into_bytes()

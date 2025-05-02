@@ -7,7 +7,7 @@ use super::builtins::{ConnectionPayload, ErrorPayload, PingPayload};
 use super::error::{ErrorPacket, NetError, Result};
 use super::storage::{ClientStorage, StorageError};
 use super::task::TaskScheduler;
-use super::traits::{NetDecoder, SocketHandler};
+use super::traits::SocketHandler;
 use super::{
     ClientAddr, ClientId, Deliverable, LocalSocket, Packet, PacketLabel, RemoteSocket,
     SocketOptions,
@@ -438,7 +438,7 @@ impl Socket {
 
     /// Processes the connection packet for the socket. This handles both server and client modes.
     fn packet_action_connection(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
-        let Ok((conn, _)) = ConnectionPayload::decode(packet.payload()) else {
+        let Ok(conn) = packet.payload::<ConnectionPayload>() else {
             // Failed to decode connection payload, return an error.
             flee!(NetError::InvalidPacket(
                 *addr,
@@ -484,7 +484,7 @@ impl Socket {
 
     /// Processes a ping packet. This handles both ping and pong packets.
     fn packet_action_ping(&mut self, packet: &Packet, addr: &ClientAddr) -> Result<()> {
-        let Ok((ping, _)) = PingPayload::decode(packet.payload()) else {
+        let Ok(ping) = packet.payload::<PingPayload>() else {
             // Failed to decode ping payload, return an error.
             flee!(NetError::InvalidPacket(
                 *addr,
@@ -512,7 +512,7 @@ impl Socket {
             return Ok(());
         }
 
-        let Ok((payload, _)) = ErrorPayload::decode(packet.payload()) else {
+        let Ok(payload) = packet.payload::<ErrorPayload>() else {
             // Failed to decode error payload, return an error.
             // This means the payload was not a valid error packet.
             flee!(NetError::InvalidPacket(
@@ -627,7 +627,7 @@ impl Socket {
         }
 
         // Update the sequence number for the packet if it's not a connect packet.
-        if packet.source() != ClientId::INVALID || packet.label() != PacketLabel::Connect {
+        if packet.source() != ClientId::INVALID && packet.source() == self.id() {
             if let Some(seq) = self.clients.get_sequence_mut(to) {
                 *seq = seq.wrapping_add(1);
                 packet.set_sequence(*seq);

@@ -78,3 +78,5 @@ impl std::fmt::Display for NetError {
         }
     }
 }
+
+impl std::error::Error for NetError {}

@@ -3,13 +3,8 @@ use std::time::{Duration, Instant};
 /// Controls loop ticks in increments to maintain TPS.
 pub struct Timestep {
     pub last_ts: Instant,    // Last timestamp processed.
-    pub tick: u64,           // Current tick count.
+    tick: u64,               // Current tick count.
     tick_duration: Duration, // Duration of each tick.
-
-    // For FPS tracking.
-    fps: f32,              // Current frames-per-second (FPS).
-    frame_count: f32,      // Number of frames since last FPS update.
-    accumulator: Duration, // Accumulator for time since last FPS update.
 }
 
 impl Timestep {
@@ -19,52 +14,34 @@ impl Timestep {
             last_ts: Instant::now(),
             tick: 0,
             tick_duration: Duration::from_secs_f32(1.0 / tick_rate),
-
-            fps: 0.0,
-            frame_count: 0.0,
-            accumulator: Duration::default(),
         }
     }
 
-    /// Returns the most recently computed frames-per-second (FPS).
-    #[allow(dead_code)]
-    pub fn fps(&self) -> f32 {
-        self.fps
+    /// Returns the fixed delta time in seconds.
+    #[inline]
+    pub fn fixed_dt(&self) -> f32 {
+        self.tick_duration.as_secs_f32()
     }
 
-    /// Blocks until the next tick is due, and updates the tick count. Returns the amount of ticks behind.
+    /// Returns the current tick count.
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Blocks until the next tick is due, and updates the tick count.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub fn wait(&mut self) -> u32 {
+    pub fn wait(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_ts);
 
         // Check if we're behind schedule.
-        let behind = if elapsed < self.tick_duration {
-            let remainder = self.tick_duration - elapsed;
-            std::thread::sleep(remainder);
-            0
-        } else {
-            let passed = (elapsed.as_secs_f32() / self.tick_duration.as_secs_f32()).floor() as u32;
-            passed.saturating_sub(1)
-        };
-
-        // Keep our tick and timestamp up to date.
-        let update_ts = Instant::now();
-        let real_elapsed = update_ts.duration_since(self.last_ts);
-        self.last_ts = update_ts;
-        self.tick += 1;
-
-        // Update our FPS counters.
-        self.frame_count += 1.0;
-        self.accumulator += real_elapsed;
-
-        // Every time we accumulate >= 1 second, we compute an FPS snapshot.
-        if self.accumulator.as_secs_f32() >= 1.0 {
-            self.fps = self.frame_count / self.accumulator.as_secs_f32();
-            self.frame_count = 0.0;
-            self.accumulator = Duration::default();
+        if elapsed < self.tick_duration {
+            std::thread::sleep(self.tick_duration - elapsed);
         }
 
-        behind
+        // Keep our tick and timestamp up to date.
+        self.last_ts = Instant::now();
+        self.tick += 1;
     }
 }

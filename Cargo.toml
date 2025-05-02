@@ -34,3 +34,4 @@ rpath = false
 
 [dependencies]
 netcode_derive = { path = "netcode_derive" }
+sdl3 = { version = "0", features = ["build-from-source"] }

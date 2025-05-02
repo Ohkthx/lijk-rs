@@ -1,23 +1,25 @@
 #![warn(clippy::pedantic)]
 
 use std::fmt::Display;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use client::Client;
+use client::ClientCore;
 use error::{AppError, Result};
 use net::{Socket, SocketOptions};
-use server::Server;
-use utils::Timestep;
+use server::ServerCore;
 
 mod client;
 mod error;
 mod net;
 mod server;
+mod shared;
 mod utils;
+mod vec2f;
 
-const SERVER_TICK_RATE: f32 = 2048.0;
-const CLIENT_TICK_RATE: f32 = SERVER_TICK_RATE;
+const SERVER_TICK_RATE: u16 = 10;
+const _CLIENT_TICK_RATE: u16 = 30;
 
 enum Flags {
     Help,
@@ -43,12 +45,12 @@ impl Flags {
     fn help() -> String {
         let mut header = String::from("Usage: cargo run -- ");
         for flag in &Flags::ENABLED {
-            header.push_str(&format!("[{flag}] "));
+            write!(&mut header, "[{flag}] ").unwrap();
         }
 
         header.push_str("\n\nOptions:");
         for flag in &Flags::ENABLED {
-            header.push_str(&format!("\n  {}", flag.description()));
+            write!(&mut header, "\n  {}", flag.description()).unwrap();
         }
         header
     }
@@ -86,21 +88,21 @@ impl Display for Flags {
 }
 
 /// Spawns a server and a client in separate threads.
-fn as_solo(args: &[String]) -> Result<()> {
+fn as_solo(args: &[String]) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     let (sconn, cconn) = if args.contains(&Flags::Remote.to_string()) {
         // Initialize the remote connections.
         let server_opts = SocketOptions::default_server();
-        let server = Socket::new_remote(&server_opts).map_err(AppError::NetError)?;
+        let server = Socket::new_remote(&server_opts).map_err(AppError::Net)?;
 
         let client_opts = SocketOptions::default_client().server_address(server.addr());
-        let client = Socket::new_remote(&client_opts).map_err(AppError::NetError)?;
+        let client = Socket::new_remote(&client_opts).map_err(AppError::Net)?;
 
         (server, client)
     } else if args.contains(&Flags::Local.to_string()) {
         // Initialize the local connections.
-        Socket::new_local_pair().map_err(AppError::NetError)?
+        Socket::new_local_pair().map_err(AppError::Net)?
     } else {
-        Socket::new_local_pair().map_err(AppError::NetError)?
+        Socket::new_local_pair().map_err(AppError::Net)?
     };
 
     // Create a shutdown flag to signal the server to stop.
@@ -109,78 +111,35 @@ fn as_solo(args: &[String]) -> Result<()> {
 
     // Spawn the server with a connection in a separate thread.
     let server_run = std::thread::spawn(move || {
-        let mut server = Server::new(sconn);
-        let mut timestep = Timestep::new(SERVER_TICK_RATE);
-
-        while !flag_clone.load(Ordering::Relaxed) {
-            if let Err(why) = server.run_step() {
-                println!("SERVER: Error while performing run step: {why}");
-            }
-
-            let behind = timestep.wait();
-            if behind > 0 {
-                debugln!("SERVER: Behind by {} ticks.", behind);
-            }
-        }
+        let _ = ServerCore::new(sconn, Some(flag_clone)).run(SERVER_TICK_RATE);
     });
 
     // Create the client with a connection.
-    let mut client = Client::new(cconn);
-    client.wait_for_connection()?;
-    let mut timestep = Timestep::new(CLIENT_TICK_RATE);
-
-    loop {
-        if let Err(why) = client.run_step() {
-            shutdown_flag.store(true, Ordering::Relaxed);
-            println!("CLIENT: Error while performing run step: {why}");
-            break;
-        }
-
-        let behind = timestep.wait();
-        if behind > 0 {
-            debugln!("CLIENT: Behind by {} ticks.", behind);
-        }
-    }
+    let mut client = ClientCore::new(cconn)?;
+    client.run()?;
+    shutdown_flag.store(true, Ordering::Relaxed);
 
     server_run.join().expect("Server thread panicked.");
     Ok(())
 }
 
 /// Spawns a remote client used to connect to a remote server.
-fn as_client() -> Result<()> {
+fn as_client() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     // Create a socket to connect to the server.
     let client_opts = SocketOptions::default_client();
-    let socket = Socket::new_remote(&client_opts).map_err(AppError::NetError)?;
+    let socket = Socket::new_remote(&client_opts).map_err(AppError::Net)?;
 
-    let mut client = Client::new(socket);
-    client.wait_for_connection()?;
-    let mut timestep = Timestep::new(CLIENT_TICK_RATE);
-
-    loop {
-        client.run_step()?;
-
-        let behind = timestep.wait();
-        if behind > 0 {
-            debugln!("CLIENT: Behind by {} ticks.", behind);
-        }
-    }
+    let mut client = ClientCore::new(socket)?;
+    client.run()?;
+    Ok(())
 }
 
 /// Spawns a server that clients can connect to.
-fn as_server() -> Result<()> {
+fn as_server() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     let server_opts = SocketOptions::default_server();
-    let socket = Socket::new_remote(&server_opts).map_err(AppError::NetError)?;
-    let mut server = Server::new(socket);
-    let mut timestep = Timestep::new(SERVER_TICK_RATE);
-
-    loop {
-        server.run_step()?;
-
-        let behind = timestep.wait();
-        if behind > 0 {
-            debugln!("SERVER: Behind by {} ticks.", behind);
-        }
-    }
+    let socket = Socket::new_remote(&server_opts).map_err(AppError::Net)?;
+    ServerCore::new(socket, None).run(SERVER_TICK_RATE)?;
+    Ok(())
 }
 
 fn main() {

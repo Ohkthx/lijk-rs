@@ -4,15 +4,40 @@ use super::netcode_derive::{NetDecode, NetEncode};
 use super::traits::{NetDecoder, NetEncoder};
 
 /// Packet labels for connections that can be sent.
-#[derive(PartialEq, Copy, Clone, Debug, NetEncode)]
+#[derive(PartialEq, Copy, Clone, Debug)]
+#[repr(u8)]
 pub enum PacketLabel {
-    Error = 0x00, // Error packet, used to specify an error.
-    Acknowledge,  // Acknowledge an action.
-    Connect,      // Connect to a server or client.
-    Disconnect,   // Disconnect from a server or client.
-    Ping,         // Ping packet, used to check if the connection is alive.
-    Message,      // Message packet, used to send a message to a server or client.
-    Unknown,      // Unknown packet.
+    /// Error packet, used to specify an error.
+    Error = 0x00,
+    /// Acknowledge an action.
+    Acknowledge,
+    /// Connect to a server or client.
+    Connect,
+    /// Disconnect from a server or client.
+    Disconnect,
+    /// Ping packet, used to check if the connection is alive.
+    Ping,
+    /// Message packet, used to send a message to a server or client.
+    Message,
+    /// Expandable packet label, can be >= 0x06.
+    Extension(u8),
+}
+
+impl NetEncoder for PacketLabel {
+    fn encode(self) -> Vec<u8> {
+        // Encode the packet label as a single byte.
+        let mut buffer = vec![0; 1];
+        buffer[0] = match self {
+            PacketLabel::Error => 0x00,
+            PacketLabel::Acknowledge => 0x01,
+            PacketLabel::Connect => 0x02,
+            PacketLabel::Disconnect => 0x03,
+            PacketLabel::Ping => 0x04,
+            PacketLabel::Message => 0x05,
+            PacketLabel::Extension(value) => value,
+        };
+        buffer
+    }
 }
 
 impl NetDecoder for PacketLabel {
@@ -30,7 +55,7 @@ impl NetDecoder for PacketLabel {
             0x03 => Ok((PacketLabel::Disconnect, 1)),
             0x04 => Ok((PacketLabel::Ping, 1)),
             0x05 => Ok((PacketLabel::Message, 1)),
-            _ => Ok((PacketLabel::Unknown, 1)),
+            value => Ok((PacketLabel::Extension(value), 1)),
         }
     }
 }
@@ -92,8 +117,10 @@ impl Packet {
 
     /// Obtains the payload of the packet.
     #[inline]
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    pub fn payload<T: NetDecoder>(&self) -> Result<T> {
+        T::decode(&self.payload)
+            .map(|(payload, _)| payload)
+            .map_err(|_| NetError::NetCode("Failed to decode payload".to_string()))
     }
 
     /// Sets the payload of the packet.
