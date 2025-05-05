@@ -46,9 +46,9 @@ pub struct ServerState {
     pub tick_id: u64,
 }
 
-/// Represents a position for an entity.
+/// Represents an Entity ID, position, and velocity.
 #[derive(NetDecode, NetEncode, Debug, Clone, Copy)]
-pub struct Position(pub u32, pub Vec2f);
+pub struct Position(pub u32, pub Vec2f, pub Vec2f);
 
 /// Represents a movement command with a movement delta and speed.
 #[derive(NetDecode, NetEncode, Debug, Clone, Copy)]

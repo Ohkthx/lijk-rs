@@ -26,7 +26,7 @@ pub struct ClientCore {
 
 impl ClientCore {
     const SIZE: u16 = 32;
-    const WIDTH: u32 = Self::SIZE as u32 * 10;
+    const WIDTH: u32 = Self::SIZE as u32 * 20;
     const HEIGHT: u32 = Self::WIDTH;
 
     /// Creates a new client core by initializing the SDL context and creating a window.
@@ -77,7 +77,7 @@ impl ClientCore {
         let mut server_state_ms = Instant::now(); // Time when the server state was last received.
         let mut _server_tick_est: u64; // Estimated tick from the server.
 
-        let mut entity_pos: HashMap<u32, (Vec2f, Vec2f)> = HashMap::new();
+        let mut entity_pos: HashMap<u32, (Vec2f, Vec2f, Vec2f)> = HashMap::new();
 
         'game_loop: loop {
             // Get the delta time.
@@ -99,7 +99,7 @@ impl ClientCore {
                     PacketLabel::Extension(id) if id == u8::from(PayloadId::Connect) => {
                         let Connect(entity, spawn_point) = decode::<Connect>(&packet)?;
                         entity_id = entity;
-                        entity_pos.insert(entity, (spawn_point, spawn_point));
+                        entity_pos.insert(entity, (spawn_point, spawn_point, Vec2f::ZERO));
                         dest = spawn_point;
                     }
                     PacketLabel::Extension(id) if id == u8::from(PayloadId::State) => {
@@ -108,13 +108,15 @@ impl ClientCore {
                         server_state_ms = Instant::now(); // Reset the server state time.
                     }
                     PacketLabel::Extension(id) if id == u8::from(PayloadId::Position) => {
-                        let Position(entity, server_pos) = decode::<Position>(&packet)?;
+                        let Position(entity, server_pos, vel) = decode::<Position>(&packet)?;
                         let scaled_pos = server_pos.scale(f32::from(Self::SIZE));
-                        if let Some((_local, remote)) = entity_pos.get_mut(&entity) {
+                        let scaled_view = vel.scale(f32::from(Self::SIZE));
+                        if let Some((_local, remote, view)) = entity_pos.get_mut(&entity) {
                             *remote = scaled_pos;
+                            *view = scaled_view;
                         } else {
                             // Add a new remote player.
-                            entity_pos.insert(entity, (scaled_pos, scaled_pos));
+                            entity_pos.insert(entity, (scaled_pos, scaled_pos, scaled_view));
                         }
                     }
 
@@ -130,7 +132,7 @@ impl ClientCore {
                     Input::Cursor(dx, dy) => dest = Vec2f(*dx, *dy),
                     Input::Speed(s) => speed = *s,
                     Input::MoveDelta(delta) => {
-                        if let Some((local, _)) = entity_pos.get_mut(&entity_id) {
+                        if let Some((local, _, _)) = entity_pos.get_mut(&entity_id) {
                             if dest.length() > f32::from(Self::SIZE) {
                                 dest = *local;
                             }
@@ -162,7 +164,7 @@ impl ClientCore {
             self.draw_grid(Color::RGB(0, 0, 0));
 
             // Render the local player's position.
-            for (entity, (local, remote)) in &mut entity_pos {
+            for (entity, (local, remote, view)) in &mut entity_pos {
                 // Update the position of the remote player.
                 *local += (*remote - *local).scale((LERP_SNAP_SPEED * dt).min(1.0));
 
@@ -174,9 +176,15 @@ impl ClientCore {
                     self.render_pos(*remote, Color::RGB(0, 255, 255));
                     self.render_pos(*local, Color::RGB(0, 255, 0));
                 }
+
+                // Render the direction they are facing.
+                let start_x = remote.0 + f32::from(Self::SIZE) / 2.0;
+                let start_y = remote.1 + f32::from(Self::SIZE) / 2.0;
+                let start = Vec2f(start_x, start_y);
+                self.render_line(start, start + view.scale(4.0), Color::RGB(255, 0, 0));
             }
 
-            self.render_pos(dest, Color::RGB(0, 0, 0));
+            // self.render_pos(dest, Color::RGB(0, 0, 0));
 
             self.canvas.present();
         }
@@ -212,5 +220,17 @@ impl ClientCore {
             Self::SIZE.into(),      // width
             Self::SIZE.into(),      // height
         ));
+    }
+
+    /// Renders a colored line from the starting position to ending.
+    pub(crate) fn render_line(&mut self, start: Vec2f, end: Vec2f, color: Color) {
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.draw_line(start, end);
+    }
+}
+
+impl From<Vec2f> for FPoint {
+    fn from(vec: Vec2f) -> FPoint {
+        FPoint { x: vec.0, y: vec.1 }
     }
 }

@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
+mod ai;
 mod components;
 mod core;
 mod ecs;
 mod socket;
+mod spawner;
 mod sys;
 mod world_map;
 
