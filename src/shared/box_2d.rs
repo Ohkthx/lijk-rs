@@ -5,7 +5,7 @@ pub struct Box2D {
     pub position: Vec2f, // Top-left position.
     pub center: Vec2f,   // Center position.
     pub width: f32,      // Width (x-axis).
-    pub length: f32,     // Length (y-axis)
+    pub length: f32,     // Length (y-axis).
 }
 
 impl Box2D {

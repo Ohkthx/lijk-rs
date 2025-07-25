@@ -53,6 +53,7 @@ impl ClientCore {
     }
 
     /// Runs the main loop for the client application. Handles input events, server updates, and rendering.
+    #[allow(clippy::too_many_lines)]
     pub fn run(&mut self) -> Result<(), AppError> {
         const LERP_SNAP_SPEED: f32 = 10.0; // “pull‑to‑server” speed in Hz
 
@@ -66,7 +67,6 @@ impl ClientCore {
 
         let mut entity_id = 0;
 
-        let mut dest: Vec2f = Vec2f::ZERO;
         let mut speed: u8 = 1;
 
         let mut last_frame_time = Instant::now();
@@ -100,7 +100,6 @@ impl ClientCore {
                         let Connect(entity, spawn_point) = decode::<Connect>(&packet)?;
                         entity_id = entity;
                         entity_pos.insert(entity, (spawn_point, spawn_point, Vec2f::ZERO));
-                        dest = spawn_point;
                     }
                     PacketLabel::Extension(id) if id == u8::from(PayloadId::State) => {
                         server_state = decode::<ServerState>(&packet)?;
@@ -109,14 +108,12 @@ impl ClientCore {
                     }
                     PacketLabel::Extension(id) if id == u8::from(PayloadId::Position) => {
                         let Position(entity, server_pos, vel) = decode::<Position>(&packet)?;
-                        let scaled_pos = server_pos.scale(f32::from(Self::SIZE));
-                        let scaled_view = vel.scale(f32::from(Self::SIZE));
                         if let Some((_local, remote, view)) = entity_pos.get_mut(&entity) {
-                            *remote = scaled_pos;
-                            *view = scaled_view;
+                            *remote = server_pos;
+                            *view = vel;
                         } else {
                             // Add a new remote player.
-                            entity_pos.insert(entity, (scaled_pos, scaled_pos, scaled_view));
+                            entity_pos.insert(entity, (server_pos, server_pos, vel));
                         }
                     }
 
@@ -129,17 +126,12 @@ impl ClientCore {
             for input in &input_state.events {
                 match input {
                     Input::Quit => break 'game_loop,
-                    Input::Cursor(dx, dy) => dest = Vec2f(*dx, *dy),
+                    Input::Cursor(_dx, _dy) => (),
                     Input::Speed(s) => speed = *s,
                     Input::MoveDelta(delta) => {
                         if let Some((local, _, _)) = entity_pos.get_mut(&entity_id) {
-                            if dest.length() > f32::from(Self::SIZE) {
-                                dest = *local;
-                            }
-
                             move_delta = *delta;
-                            dest += delta.scale(f32::from(Self::SIZE));
-                            *local += delta.scale(dt * f32::from(speed) * f32::from(Self::SIZE));
+                            *local += delta.scale(dt);
                         }
                     }
                 }
@@ -168,23 +160,25 @@ impl ClientCore {
                 // Update the position of the remote player.
                 *local += (*remote - *local).scale((LERP_SNAP_SPEED * dt).min(1.0));
 
+                let scaled_local = local.scale(f32::from(Self::SIZE));
+                let scaled_remote = remote.scale(f32::from(Self::SIZE));
+                let scaled_view = view.scale(f32::from(Self::SIZE));
+
                 // Render the remote players.
                 if entity == &entity_id {
-                    self.render_pos(*remote, Color::RGB(255, 0, 0));
-                    self.render_pos(*local, Color::RGB(0, 0, 255));
+                    self.render_pos(scaled_remote, Color::RGB(255, 0, 0));
+                    self.render_pos(scaled_local, Color::RGB(0, 0, 255));
                 } else {
-                    self.render_pos(*remote, Color::RGB(0, 255, 255));
-                    self.render_pos(*local, Color::RGB(0, 255, 0));
+                    self.render_pos(scaled_remote, Color::RGB(0, 255, 255));
+                    self.render_pos(scaled_local, Color::RGB(0, 255, 0));
                 }
 
                 // Render the direction they are facing.
-                let start_x = remote.0 + f32::from(Self::SIZE) / 2.0;
-                let start_y = remote.1 + f32::from(Self::SIZE) / 2.0;
+                let start_x = scaled_remote.0 + f32::from(Self::SIZE) / 2.0;
+                let start_y = scaled_remote.1 + f32::from(Self::SIZE) / 2.0;
                 let start = Vec2f(start_x, start_y);
-                self.render_line(start, start + view.scale(4.0), Color::RGB(255, 0, 0));
+                self.render_line(start, start + scaled_view, Color::RGB(255, 0, 0));
             }
-
-            // self.render_pos(dest, Color::RGB(0, 0, 0));
 
             self.canvas.present();
         }

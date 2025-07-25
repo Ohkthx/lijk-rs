@@ -1,7 +1,9 @@
 mod macros;
+mod spatial_hash;
 mod sset;
 mod timestep;
 
+pub use spatial_hash::SpatialHash;
 pub use sset::SparseSet;
 pub use timestep::Timestep;
 

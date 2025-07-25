@@ -13,8 +13,7 @@ pub(crate) struct BasicAi {
 impl BasicAi {
     pub fn new() -> Self {
         Self {
-            state: AiState::Wander(3.0, 1),
-            // state: AiState::Pursue,
+            state: AiState::Idle,
         }
     }
 

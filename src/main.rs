@@ -18,7 +18,7 @@ mod shared;
 mod utils;
 mod vec2f;
 
-const SERVER_TICK_RATE: u16 = 10;
+const SERVER_TICK_RATE: u16 = 20;
 const _CLIENT_TICK_RATE: u16 = 30;
 
 enum Flags {

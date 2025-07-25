@@ -7,12 +7,13 @@ use crate::server::ai::AiState;
 use crate::shared::payload::{
     Connect, Movement, PayloadId, Position as PositionPayload, ServerState,
 };
-use crate::utils::{Timestep, decode};
+use crate::shared::shape::Rectangle;
+use crate::shared::transform::Transform;
+use crate::utils::{SpatialHash, Timestep, decode};
 use crate::vec2f::Vec2f;
 
 use super::ClientEntityMap;
 use super::ai::BasicAi;
-use super::components::Position;
 use super::ecs::{Entity, World};
 use super::socket::ServerSocket;
 use super::spawner::{Owner, Spawner};
@@ -28,7 +29,8 @@ impl Slime {
         world
             .spawn_entity()
             .attach(Name("a Slime".to_string()))
-            .attach(Position(pos))
+            .attach(Transform::with_position(pos))
+            .attach(Rectangle::new(1.0, 1.0))
             .attach(Movement(Vec2f::ZERO, 1))
             .attach(BasicAi::new())
             .attach(LastTarget(None))
@@ -58,26 +60,31 @@ impl ServerCore {
         // Allows for bi-directional mapping between clients and entities.
         let mut client_entity = ClientEntityMap::new();
 
+        // Spatial hash for tracking entitiy positions and detecting collisions.
+        let mut gps = SpatialHash::new(1.0);
+
         // Create a new world instance to manage entities and components.
         let mut world = World::new();
-        world.register_component::<Position>();
+        world.register_component::<Transform>();
+        world.register_component::<Rectangle>();
         world.register_component::<Movement>();
-        world.register_component::<Spawner>();
         world.register_component::<Owner>();
         world.register_component::<BasicAi>();
-        world.register_component::<Name>();
         world.register_component::<LastTarget>();
+        world.register_component::<Name>();
+        world.register_component::<Spawner>();
 
         let world_map = WorldMap::new(Vec2f(10.0, 10.0), 18.0, 18.0);
 
         // Create a spawner to generate test entities.
-        world
-            .spawn_entity()
-            .attach(Spawner::new(20, 5.0, 0.5))
-            .attach(Position(*world_map.spawn_point()))
-            .build();
+        // world
+        //     .spawn_entity()
+        //     .attach(Spawner::new(20, 5.0, 0.5))
+        //     .attach(Position(*world_map.spawn_point()))
+        //     .build();
 
-        let slime = Slime::spawn(&mut world, *world_map.spawn_point());
+        let slime = Slime::spawn(&mut world, *world_map.spawn_point() + Vec2f(10.0, 10.0));
+        gps.insert(*world_map.spawn_point(), slime.into());
 
         'core_loop: loop {
             // Ensure a kill command has not been sent.
@@ -105,6 +112,7 @@ impl ServerCore {
                 }
             }
 
+            // Process all incoming packets.
             let packets = self.socket.run_step()?;
             for packet in packets {
                 match packet.label() {
@@ -113,7 +121,11 @@ impl ServerCore {
 
                         // Spawn a new entity for the client.
                         let entity = world.spawn_entity().build();
-                        world.attach_component(entity, Position(Vec2f::ZERO));
+                        world.attach_component(entity, Rectangle::new(1.0, 1.0));
+                        world.attach_component(
+                            entity,
+                            Transform::with_position(*world_map.spawn_point()),
+                        );
                         client_entity.add(packet.source(), entity);
 
                         // Make the slime follow the player.
@@ -142,20 +154,22 @@ impl ServerCore {
                 }
             }
 
+            // Trigger a run on the systems.
             let label = PacketLabel::Extension(u8::from(PayloadId::Position));
             sys::ai(&mut world);
-            let mut changes = sys::movement(&mut world, &world_map, step.fixed_dt());
+            let mut changes = sys::movement(&mut world, &world_map, &mut gps, step.fixed_dt());
             changes.extend(sys::spawn(&mut world, &world_map));
 
-            world.fetch_components(|entity, pos: &Position, movement: &Movement| {
-                if !changes.contains(&entity) {
-                    return;
-                }
-
+            // Send new positions to the clients.
+            world.fetch_components(|entity, transform: &Transform, movement: &Movement| {
                 for client in client_entity.iter_clients() {
                     // Send the updated position to all clients.
                     let mut to_send = Packet::new(label, self.socket.id());
-                    to_send.set_payload(PositionPayload(u32::from(entity), pos.0, movement.0));
+                    to_send.set_payload(PositionPayload(
+                        u32::from(entity),
+                        transform.position,
+                        movement.0,
+                    ));
                     self.socket.send(*client, to_send).unwrap();
                 }
             });

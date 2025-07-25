@@ -2,26 +2,27 @@ use std::collections::{HashMap, HashSet};
 
 use rand::random_range;
 
-use crate::server::components::Position;
 use crate::server::core::Slime;
 use crate::server::ecs::{Entity, World};
 use crate::server::spawner::{Owner, Spawner};
 use crate::server::world_map::WorldMap;
+use crate::shared::transform::Transform;
 use crate::vec2f::Vec2f;
 
 pub fn spawn(world: &mut World, map: &WorldMap) -> HashSet<Entity> {
-    let mut to_spawn: HashMap<Entity, Vec<Position>> = HashMap::new();
+    let mut to_spawn: HashMap<Entity, Vec<Vec2f>> = HashMap::new();
     let mut spawned = HashSet::new();
 
-    world.fetch_components(|entity, pos: &Position, spawner: &mut Spawner| {
+    world.fetch_components(|entity, transform: &Transform, spawner: &mut Spawner| {
         if spawner.at_capacity() || !spawner.is_ready() {
             return;
         }
 
         // Obtain the location of the spawned entity.
-        let offset = random_range(-spawner.radius()..=spawner.radius());
-        let dest = Vec2f(pos.0.0 + offset, pos.0.1 + offset);
-        let entity_pos = Position(map.clamp_bounds(dest));
+        let offset_x = random_range(-spawner.radius()..=spawner.radius());
+        let offset_y = random_range(-spawner.radius()..=spawner.radius());
+        let dest = transform.position + Vec2f(offset_x, offset_y);
+        let entity_pos = map.clamp_bounds(dest);
         to_spawn.entry(entity).or_default().push(entity_pos);
 
         spawner.reset();
@@ -30,7 +31,7 @@ pub fn spawn(world: &mut World, map: &WorldMap) -> HashSet<Entity> {
     // Spawn the entity.
     for (spawner_id, positions) in to_spawn {
         for pos in positions {
-            let entity_id = Slime::spawn(world, pos.0);
+            let entity_id = Slime::spawn(world, pos);
             world.attach_component(entity_id, Owner(spawner_id));
             if let Some(mut spawner) = world.fetch_component::<&mut Spawner>(spawner_id) {
                 spawner.add_entity(entity_id);
